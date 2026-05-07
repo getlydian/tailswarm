@@ -1,0 +1,15 @@
+# Binaries
+/tailswarm
+/cmd/tailswarm/tailswarm
+bin/
+
+# Test and coverage artifacts
+*.test
+*.out
+
+# Build output
+dist/
+
+# Editor/IDE
+.idea/
+.vscode/
