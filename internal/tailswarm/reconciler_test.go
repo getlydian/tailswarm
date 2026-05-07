@@ -29,11 +29,13 @@ func newHarness(t *testing.T) *reconcilerHarness {
 	s := NewStore()
 	cfg := Config{
 		LabelNamespace: "tailswarm",
-		HeadscaleUser:  "swarm",
-		KeyExpiration:  5 * time.Minute,
-		Planner: PlannerConfig{
-			Image:        "tailscale/tailscale:v1.78",
-			HeadscaleURL: "https://headscale.internal",
+		Headscale: HeadscaleConfig{
+			URL:           "https://headscale.internal",
+			User:          "swarm",
+			KeyExpiration: 5 * time.Minute,
+		},
+		Sidecar: SidecarConfig{
+			Image: "tailscale/tailscale:v1.78",
 		},
 	}
 	r := NewReconciler(d, c, s, cfg)

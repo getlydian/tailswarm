@@ -43,30 +43,6 @@ type DockerClient interface {
 	ListNetworks(ctx context.Context) ([]swarm.Network, error)
 }
 
-// Config groups the runtime knobs the reconciler needs. The full config
-// loader lands in step 9; for now this is a hand-rolled subset.
-type Config struct {
-	// LabelNamespace is forwarded into Labels.Namespace ("tailswarm" by
-	// default).
-	LabelNamespace string
-
-	// AllowedTagPrefixes is the allowlist enforced when a service
-	// overrides tailswarm.tag.
-	AllowedTagPrefixes []string
-
-	// HeadscaleUser owns every minted ephemeral key.
-	HeadscaleUser string
-
-	// KeyExpiration is how long a freshly-minted key stays valid.
-	// DESIGN.md §8 recommends a few minutes — the sidecar consumes the
-	// key on first start.
-	KeyExpiration time.Duration
-
-	// Planner is the per-deployment planner config (image, headscale
-	// URL); NetworkID is filled in per-target by the reconciler.
-	Planner PlannerConfig
-}
-
 // Reconciler converges Docker Swarm services into a tailnet sidecar set.
 // All external interactions go through DockerClient and Controller, so
 // the reconciler is testable without real Docker or Headscale.
@@ -88,14 +64,18 @@ func NewReconciler(d DockerClient, c Controller, s *Store, cfg Config) *Reconcil
 		Store:  s,
 		Cfg:    cfg,
 	}
+	rps := r.Cfg.Reconcile.RateLimitRPS
+	if rps <= 0 {
+		rps = 5
+	}
 	if r.Limiter == nil {
-		r.Limiter = rate.NewLimiter(rate.Limit(5), 5)
+		r.Limiter = rate.NewLimiter(rate.Limit(rps), int(rps))
 	}
 	if r.Log == nil {
 		r.Log = slog.Default()
 	}
-	if r.Cfg.KeyExpiration == 0 {
-		r.Cfg.KeyExpiration = 5 * time.Minute
+	if r.Cfg.Headscale.KeyExpiration == 0 {
+		r.Cfg.Headscale.KeyExpiration = 5 * time.Minute
 	}
 	if r.Cfg.LabelNamespace == "" {
 		r.Cfg.LabelNamespace = defaultNamespace
@@ -154,8 +134,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, serviceID string) error {
 		return fmt.Errorf("resolve network %q: not found", tgt.Network)
 	}
 
-	plannerCfg := r.Cfg.Planner
-	plannerCfg.NetworkID = netID
+	plannerCfg := PlannerConfig{
+		Image:        r.Cfg.Sidecar.Image,
+		HeadscaleURL: r.Cfg.Headscale.URL,
+		NetworkID:    netID,
+	}
 
 	prev, hadPrev := r.Store.Get(serviceID)
 
@@ -177,11 +160,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, serviceID string) error {
 		return fmt.Errorf("rate limit: %w", err)
 	}
 	key, err := r.Ctrl.CreateEphemeralKey(ctx, KeyRequest{
-		User:       r.Cfg.HeadscaleUser,
+		User:       r.Cfg.Headscale.User,
 		Tags:       []string{tgt.Tag},
 		Ephemeral:  true,
 		Reusable:   false,
-		Expiration: r.Cfg.KeyExpiration,
+		Expiration: r.Cfg.Headscale.KeyExpiration,
 	})
 	if err != nil {
 		return fmt.Errorf("mint key: %w", err)
@@ -352,7 +335,7 @@ func (r *Reconciler) Resync(ctx context.Context) error {
 	if err := r.Limiter.Wait(ctx); err != nil {
 		return err
 	}
-	nodes, err := r.Ctrl.ListNodes(ctx, r.Cfg.HeadscaleUser)
+	nodes, err := r.Ctrl.ListNodes(ctx, r.Cfg.Headscale.User)
 	if err != nil {
 		return fmt.Errorf("list nodes: %w", err)
 	}
