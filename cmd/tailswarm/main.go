@@ -36,22 +36,17 @@ func main() {
 	}
 }
 
-// runDeps lets tests inject a fake Docker + Controller without going
-// through the real SDK. Production callers pass nil and run() builds the
-// real implementations from config.
+// runDeps lets tests inject a fake Docker + Controller + ProxyFactory
+// without going through tsnet or the real SDK.
 type runDeps struct {
 	Docker     tailswarm.DockerClient
 	Events     tailswarm.EventStream
 	Controller tailswarm.Controller
-	// Started fires after Resync completes and the watcher loop is
-	// running. Tests use it to know when it's safe to inject events.
-	Started chan<- struct{}
+	NewProxy   tailswarm.ProxyFactory
+	Started    chan<- struct{}
 }
 
-// run is the testable wrapper around the daemon. It loads config,
-// builds the dependency graph, runs the resync, and then drives the
-// watcher → queue → reconciler pipeline until ctx is cancelled.
-func run(ctx context.Context, args []string, env func(string) string, stdout, stderr io.Writer, deps *runDeps) error {
+func run(ctx context.Context, args []string, env func(string) string, _, stderr io.Writer, deps *runDeps) error {
 	if env == nil {
 		env = os.Getenv
 	}
@@ -72,18 +67,18 @@ func run(ctx context.Context, args []string, env func(string) string, stdout, st
 	logger = logger.With("component", "tailswarm")
 	slog.SetDefault(logger)
 
-	// Wire dependencies. Tests pass deps; production builds the real
-	// docker + headscale clients.
 	var (
 		dockerClient tailswarm.DockerClient
 		eventStream  tailswarm.EventStream
 		ctrl         tailswarm.Controller
+		newProxy     tailswarm.ProxyFactory
 		closeFns     []func() error
 	)
 	if deps != nil {
 		dockerClient = deps.Docker
 		eventStream = deps.Events
 		ctrl = deps.Controller
+		newProxy = deps.NewProxy
 	}
 	if dockerClient == nil || eventStream == nil {
 		d, err := tailswarm.NewDocker()
@@ -104,6 +99,9 @@ func run(ctx context.Context, args []string, env func(string) string, stdout, st
 			APIKey:  cfg.Headscale.APIKey,
 		}
 	}
+	if newProxy == nil {
+		newProxy = tailswarm.NewTsnetProxy
+	}
 	defer func() {
 		for _, fn := range closeFns {
 			if err := fn(); err != nil {
@@ -115,15 +113,7 @@ func run(ctx context.Context, args []string, env func(string) string, stdout, st
 	store := tailswarm.NewStore()
 	reconciler := tailswarm.NewReconciler(dockerClient, ctrl, store, cfg)
 	reconciler.Log = logger.With("subcomponent", "reconciler")
-
-	// DESIGN.md §7: rebuild state from authoritative sources before we
-	// start consuming events, so a tailswarm restart doesn't double-mint
-	// keys or leave orphan sidecars from a previous crash.
-	if err := reconciler.Resync(ctx); err != nil {
-		// A failed resync isn't fatal — Headscale or Docker may be
-		// transiently unavailable on boot — but it's worth shouting.
-		logger.Warn("startup resync failed; continuing", "err", err)
-	}
+	reconciler.NewProxy = newProxy
 
 	queue := tailswarm.NewQueue(defaultWorkerCount, defaultQueueBuffer)
 	events := make(chan string, defaultEventChanDepth)
@@ -139,8 +129,6 @@ func run(ctx context.Context, args []string, env func(string) string, stdout, st
 
 	var wg sync.WaitGroup
 
-	// Watcher → queue feeder. A tiny shim so the watcher's typed channel
-	// drives the queue's Enqueue method, with ctx-aware shutdown.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -157,7 +145,6 @@ func run(ctx context.Context, args []string, env func(string) string, stdout, st
 		}
 	}()
 
-	// Reconcile workers (sharded inside the queue).
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -168,7 +155,6 @@ func run(ctx context.Context, args []string, env func(string) string, stdout, st
 		})
 	}()
 
-	// Watcher loop.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -183,11 +169,13 @@ func run(ctx context.Context, args []string, env func(string) string, stdout, st
 
 	logger.Info("tailswarm started",
 		"label_namespace", cfg.LabelNamespace,
+		"network", cfg.Network,
 		"headscale_url", cfg.Headscale.URL,
 		"resync_interval", cfg.Reconcile.FullResyncInterval)
 
 	<-ctx.Done()
-	logger.Info("shutdown requested; draining workers")
+	logger.Info("shutdown requested; closing proxies")
+	reconciler.CloseAll()
 	wg.Wait()
 	return nil
 }

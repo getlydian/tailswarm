@@ -1,11 +1,12 @@
 // Package tailswarm contains the daemon that reconciles Docker Swarm
-// services opted into a tailnet against a Headscale controller.
+// services opted into a tailnet. tailswarm runs an in-process tsnet
+// server per opted-in service and TCP-forwards over a shared overlay
+// network — there are no per-service sidecar containers.
 package tailswarm
 
 import (
 	"errors"
 	"fmt"
-	"net/netip"
 	"strings"
 
 	"github.com/docker/docker/api/types/swarm"
@@ -19,17 +20,28 @@ const stackLabel = "com.docker.stack.namespace"
 // the zero value.
 const defaultNamespace = "tailswarm"
 
+// defaultOverlay is the shared overlay tailswarm and managed services
+// join by default. Operators may override per-service via
+// tailswarm.network.
+const defaultOverlay = "tailswarm-overlay"
+
+// Port is one TCP port pulled off a service's EndpointSpec. UDP and
+// other protocols are out of scope for v1.
+type Port struct {
+	Target uint32
+}
+
 // Target captures everything tailswarm needs to know about a labeled
-// Swarm service to plan its sidecar.
+// Swarm service to bring up its tsnet proxy.
 type Target struct {
-	ServiceID       string
-	ServiceName     string
-	Stack           string
-	Network         string
-	Hostname        string
-	Tag             string
-	AdvertiseRoutes []string
-	SpecVersion     uint64
+	ServiceID   string
+	ServiceName string
+	Stack       string
+	Network     string
+	Hostname    string
+	Tag         string
+	Ports       []Port
+	SpecVersion uint64
 }
 
 // Labels parses tailswarm.* deploy labels off a Swarm service.
@@ -39,35 +51,35 @@ type Target struct {
 // "tailswarm-stage.enable" labels.
 //
 // AllowedTagPrefixes is the allowlist used to validate user-supplied
-// tailswarm.tag overrides. A user-supplied tag must start with one of
-// these prefixes (after the "tag:" prefix is stripped). The default
-// derived tag (tag:swarm-<service>) is always permitted regardless of
-// this allowlist.
+// tailswarm.tag overrides. The default derived tag (tag:swarm-<service>)
+// is always permitted regardless of this allowlist.
+//
+// DefaultNetwork overrides the built-in "tailswarm-overlay" default. The
+// reconciler injects the configured shared overlay name here.
 type Labels struct {
 	Namespace          string
 	AllowedTagPrefixes []string
+	DefaultNetwork     string
 }
 
-// ErrAmbiguousNetwork is returned when a service is attached to more
-// than one user overlay and tailswarm.network is not set.
-var ErrAmbiguousNetwork = errors.New("tailswarm: service is attached to multiple overlays; tailswarm.network is required")
-
-// ErrUnknownNetwork is returned when tailswarm.network references a
-// network the service is not attached to.
-var ErrUnknownNetwork = errors.New("tailswarm: tailswarm.network does not match any of the service's networks")
-
-// ErrNoNetwork is returned when a service has no user overlay attached.
-var ErrNoNetwork = errors.New("tailswarm: service is not attached to any user overlay")
-
-// ErrTagNotAllowed is returned when tailswarm.tag is set to a value
-// outside the configured allowlist.
-var ErrTagNotAllowed = errors.New("tailswarm: tailswarm.tag is not in the allowed prefix list")
+var (
+	ErrUnknownNetwork = errors.New("tailswarm: tailswarm.network does not match any of the service's networks")
+	ErrTagNotAllowed  = errors.New("tailswarm: tailswarm.tag is not in the allowed prefix list")
+	ErrNoTCPPorts     = errors.New("tailswarm: service has no TCP ports in its endpoint spec")
+)
 
 func (l Labels) namespace() string {
 	if l.Namespace == "" {
 		return defaultNamespace
 	}
 	return l.Namespace
+}
+
+func (l Labels) defaultNetwork() string {
+	if l.DefaultNetwork == "" {
+		return defaultOverlay
+	}
+	return l.DefaultNetwork
 }
 
 func (l Labels) key(suffix string) string {
@@ -79,11 +91,11 @@ func (l Labels) key(suffix string) string {
 // The second return value reports whether the service is opted in
 // (tailswarm.enable=true). When false, the Target value is the zero
 // value and err is nil. An error means the service IS opted in but its
-// labels are malformed.
+// labels or ports are malformed.
 //
-// `networks` should be the full list of swarm networks in the cluster,
-// used to map network IDs (which is what Swarm puts on the service) to
-// human-readable names (which is what tailswarm.network references).
+// `networks` is the full list of swarm networks in the cluster, used
+// only to validate that an explicit tailswarm.network override matches
+// a network the service is actually attached to.
 func (l Labels) Parse(svc swarm.Service, networks []swarm.Network) (Target, bool, error) {
 	labels := svc.Spec.Labels
 
@@ -96,10 +108,12 @@ func (l Labels) Parse(svc swarm.Service, networks []swarm.Network) (Target, bool
 	serviceName := svc.Spec.Name
 	shortName := strings.TrimPrefix(serviceName, stack+"_")
 
-	overlays := userOverlays(svc, networks)
-	network, err := selectNetwork(labels[l.key("network")], overlays)
-	if err != nil {
-		return Target{}, true, err
+	network := l.defaultNetwork()
+	if override, ok := labels[l.key("network")]; ok && override != "" {
+		if !serviceAttachedTo(svc, networks, override) {
+			return Target{}, true, fmt.Errorf("%w: %q", ErrUnknownNetwork, override)
+		}
+		network = override
 	}
 
 	hostname := labels[l.key("hostname")]
@@ -120,20 +134,20 @@ func (l Labels) Parse(svc swarm.Service, networks []swarm.Network) (Target, bool
 		tag = override
 	}
 
-	routes, err := parseRoutes(labels[l.key("advertise-routes")])
-	if err != nil {
-		return Target{}, true, err
+	ports := tcpPorts(svc)
+	if len(ports) == 0 {
+		return Target{}, true, ErrNoTCPPorts
 	}
 
 	return Target{
-		ServiceID:       svc.ID,
-		ServiceName:     serviceName,
-		Stack:           stack,
-		Network:         network,
-		Hostname:        hostname,
-		Tag:             tag,
-		AdvertiseRoutes: routes,
-		SpecVersion:     svc.Version.Index,
+		ServiceID:   svc.ID,
+		ServiceName: serviceName,
+		Stack:       stack,
+		Network:     network,
+		Hostname:    hostname,
+		Tag:         tag,
+		Ports:       ports,
+		SpecVersion: svc.Version.Index,
 	}, true, nil
 }
 
@@ -145,69 +159,53 @@ func isTrue(s string) bool {
 	return false
 }
 
-// userOverlays returns the names of overlay networks the service is
-// attached to, excluding swarm-managed networks like "ingress".
-func userOverlays(svc swarm.Service, networks []swarm.Network) []string {
-	byID := make(map[string]swarm.Network, len(networks))
-	byName := make(map[string]swarm.Network, len(networks))
+// serviceAttachedTo reports whether svc is attached to a network with
+// the given name. Used only to validate explicit tailswarm.network
+// overrides; the default shared overlay is trusted to be reachable from
+// tailswarm itself, which is the only side that needs it.
+func serviceAttachedTo(svc swarm.Service, networks []swarm.Network, name string) bool {
+	byID := make(map[string]string, len(networks))
 	for _, n := range networks {
-		byID[n.ID] = n
-		byName[n.Spec.Name] = n
+		byID[n.ID] = n.Spec.Name
 	}
 
 	attached := svc.Spec.TaskTemplate.Networks
 	if len(attached) == 0 {
-		// Spec.Networks is deprecated since v1.44 but still populated by
-		// older services and engines, so accept it as a fallback.
 		attached = svc.Spec.Networks //nolint:staticcheck // back-compat with pre-v1.44 services
 	}
-
-	seen := make(map[string]struct{}, len(attached))
-	var out []string
 	for _, a := range attached {
-		n, ok := byID[a.Target]
-		if !ok {
-			n, ok = byName[a.Target]
+		if a.Target == name {
+			return true
 		}
-		if !ok {
-			continue
+		if n, ok := byID[a.Target]; ok && n == name {
+			return true
 		}
-		if n.Spec.Ingress {
-			continue
-		}
-		if n.DriverState.Name != "" && n.DriverState.Name != "overlay" {
-			continue
-		}
-		name := n.Spec.Name
-		if name == "" {
-			name = a.Target
-		}
-		if _, dup := seen[name]; dup {
-			continue
-		}
-		seen[name] = struct{}{}
-		out = append(out, name)
 	}
-	return out
+	return false
 }
 
-func selectNetwork(requested string, overlays []string) (string, error) {
-	if requested != "" {
-		for _, n := range overlays {
-			if n == requested {
-				return requested, nil
-			}
+// tcpPorts returns every TCP TargetPort declared in the service's
+// EndpointSpec, deduplicated and in declaration order.
+func tcpPorts(svc swarm.Service) []Port {
+	if svc.Spec.EndpointSpec == nil {
+		return nil
+	}
+	seen := make(map[uint32]struct{}, len(svc.Spec.EndpointSpec.Ports))
+	out := make([]Port, 0, len(svc.Spec.EndpointSpec.Ports))
+	for _, p := range svc.Spec.EndpointSpec.Ports {
+		if p.Protocol != "" && p.Protocol != swarm.PortConfigProtocolTCP {
+			continue
 		}
-		return "", fmt.Errorf("%w: %q", ErrUnknownNetwork, requested)
+		if p.TargetPort == 0 {
+			continue
+		}
+		if _, dup := seen[p.TargetPort]; dup {
+			continue
+		}
+		seen[p.TargetPort] = struct{}{}
+		out = append(out, Port{Target: p.TargetPort})
 	}
-	switch len(overlays) {
-	case 0:
-		return "", ErrNoNetwork
-	case 1:
-		return overlays[0], nil
-	default:
-		return "", ErrAmbiguousNetwork
-	}
+	return out
 }
 
 func tagAllowed(tag, derived string, allowedPrefixes []string) bool {
@@ -220,24 +218,4 @@ func tagAllowed(tag, derived string, allowedPrefixes []string) bool {
 		}
 	}
 	return false
-}
-
-func parseRoutes(s string) ([]string, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return nil, nil
-	}
-	parts := strings.Split(s, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		if _, err := netip.ParsePrefix(p); err != nil {
-			return nil, fmt.Errorf("tailswarm: invalid CIDR in advertise-routes %q: %w", p, err)
-		}
-		out = append(out, p)
-	}
-	return out, nil
 }

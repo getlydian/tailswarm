@@ -15,44 +15,26 @@ import (
 
 // Headscale is a Controller backed by a Headscale REST API. Endpoints
 // follow the v1 surface documented at /swagger; field names match the
-// generated proto/swagger schema (camelCase JSON, see DESIGN.md §3
-// "Headscale's pre-auth key API").
+// generated proto/swagger schema (camelCase JSON).
 //
 // Headscale's CreatePreAuthKey takes a numeric user ID, but tailswarm
-// configures a user *name* (DESIGN.md §9.2) — Headscale users are
-// human-meaningful names, not IDs. The client therefore resolves the
-// configured name to an ID on first use and caches the result; the
-// mapping is stable for the lifetime of a Headscale user.
+// configures a user *name* — Headscale users are human-meaningful names,
+// not IDs. The client therefore resolves the configured name to an ID on
+// first use and caches the result.
 type Headscale struct {
-	// BaseURL is the Headscale root, e.g. "https://headscale.internal".
-	// A trailing slash is tolerated.
 	BaseURL string
+	APIKey  string
+	HTTP    *http.Client
 
-	// APIKey is a bearer token loaded from a Docker secret or env var.
-	// It is never logged.
-	APIKey string
-
-	// HTTP is the client used for every request. Nil falls back to a
-	// reasonable default with a 30s timeout.
-	HTTP *http.Client
-
-	// userIDCache memoises name → numeric ID lookups. Headscale does not
-	// renumber users, so a single resolution per process lifetime is
-	// enough.
 	userIDCache map[string]string
 }
 
-// Compile-time check that Headscale satisfies Controller.
 var _ Controller = (*Headscale)(nil)
 
-// HeadscaleError is the typed error wrapping non-2xx responses. It
-// preserves the HTTP status so the reconciler's backoff path can
-// distinguish 4xx (configuration / auth) from 5xx (transient) without
-// string-matching.
 type HeadscaleError struct {
 	Status int
-	Op     string // "create preauthkey", "expire preauthkey", ...
-	Body   string // truncated response body excerpt for debuggability
+	Op     string
+	Body   string
 }
 
 func (e *HeadscaleError) Error() string {
@@ -62,9 +44,6 @@ func (e *HeadscaleError) Error() string {
 	return fmt.Sprintf("headscale: %s: status %d: %s", e.Op, e.Status, e.Body)
 }
 
-// IsClientError reports whether the response was a 4xx (excluding 408
-// and 429, which are transient). Useful for the reconciler to short-
-// circuit retries on configuration errors.
 func (e *HeadscaleError) IsClientError() bool {
 	if e.Status == http.StatusRequestTimeout || e.Status == http.StatusTooManyRequests {
 		return false
@@ -72,8 +51,6 @@ func (e *HeadscaleError) IsClientError() bool {
 	return e.Status >= 400 && e.Status < 500
 }
 
-// IsServerError reports whether the response was a 5xx (or 408/429),
-// i.e. retryable.
 func (e *HeadscaleError) IsServerError() bool {
 	if e.Status == http.StatusRequestTimeout || e.Status == http.StatusTooManyRequests {
 		return true
@@ -92,10 +69,6 @@ func (h *Headscale) baseURL() string {
 	return strings.TrimRight(h.BaseURL, "/")
 }
 
-// CreateEphemeralKey mints a preauth key on Headscale. The configured
-// user name is resolved to a numeric ID on first use and cached. Tags
-// are passed through verbatim — the caller (reconciler) is responsible
-// for deriving safe tag names per DESIGN.md §8.
 func (h *Headscale) CreateEphemeralKey(ctx context.Context, req KeyRequest) (Key, error) {
 	if req.User == "" {
 		return Key{}, errors.New("headscale: KeyRequest.User is empty")
@@ -141,11 +114,6 @@ func (h *Headscale) CreateEphemeralKey(ctx context.Context, req KeyRequest) (Key
 	}, nil
 }
 
-// ExpireKey marks a previously-minted preauth key as expired. Headscale's
-// expire endpoint is idempotent: a 200 means "expired now or earlier".
-//
-// keyID must be the value returned by CreateEphemeralKey (Key.ID), not
-// the secret string.
 func (h *Headscale) ExpireKey(ctx context.Context, keyID string) error {
 	if keyID == "" {
 		return errors.New("headscale: keyID is empty")
@@ -154,59 +122,6 @@ func (h *Headscale) ExpireKey(ctx context.Context, keyID string) error {
 	return h.do(ctx, http.MethodPost, "/api/v1/preauthkey/expire", body, nil, "expire preauthkey")
 }
 
-// DeleteNode removes a registered node from Headscale. Used both during
-// per-service teardown and during the orphan sweep in Reconciler.Resync.
-func (h *Headscale) DeleteNode(ctx context.Context, nodeID string) error {
-	if nodeID == "" {
-		return errors.New("headscale: nodeID is empty")
-	}
-	path := "/api/v1/node/" + url.PathEscape(nodeID)
-	return h.do(ctx, http.MethodDelete, path, nil, nil, "delete node")
-}
-
-// ListNodes returns every node owned by user, suitable for orphan
-// detection. The user filter is forwarded to Headscale as a query
-// parameter; an empty user lists every node visible to the API key.
-func (h *Headscale) ListNodes(ctx context.Context, user string) ([]Node, error) {
-	path := "/api/v1/node"
-	if user != "" {
-		path += "?user=" + url.QueryEscape(user)
-	}
-
-	var resp struct {
-		Nodes []struct {
-			ID        string   `json:"id"`
-			Name      string   `json:"name"`
-			GivenName string   `json:"givenName"`
-			Tags      []string `json:"tags"`
-			User      struct {
-				Name string `json:"name"`
-			} `json:"user"`
-		} `json:"nodes"`
-	}
-	if err := h.do(ctx, http.MethodGet, path, nil, &resp, "list nodes"); err != nil {
-		return nil, err
-	}
-
-	out := make([]Node, 0, len(resp.Nodes))
-	for _, n := range resp.Nodes {
-		hostname := n.GivenName
-		if hostname == "" {
-			hostname = n.Name
-		}
-		out = append(out, Node{
-			ID:       n.ID,
-			Hostname: hostname,
-			User:     n.User.Name,
-			Tags:     n.Tags,
-		})
-	}
-	return out, nil
-}
-
-// resolveUserID looks up the numeric ID for a Headscale user by name,
-// caching the result. CreatePreAuthKey requires the numeric ID even
-// though every other tailswarm-facing API uses the name.
 func (h *Headscale) resolveUserID(ctx context.Context, name string) (string, error) {
 	if id, ok := h.userIDCache[name]; ok {
 		return id, nil
@@ -234,9 +149,6 @@ func (h *Headscale) resolveUserID(ctx context.Context, name string) (string, err
 	return "", fmt.Errorf("headscale: user %q not found", name)
 }
 
-// do is the shared request helper. It marshals body (when non-nil),
-// adds the bearer header, decodes a 2xx JSON response into out (when
-// non-nil), and translates non-2xx responses into *HeadscaleError.
 func (h *Headscale) do(ctx context.Context, method, path string, body, out any, op string) error {
 	var reqBody io.Reader
 	if body != nil {
@@ -273,7 +185,6 @@ func (h *Headscale) do(ctx context.Context, method, path string, body, out any, 
 	}
 
 	if out == nil {
-		// Drain so the connection can be reused.
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil
 	}

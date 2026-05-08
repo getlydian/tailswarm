@@ -12,22 +12,22 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Config is the merged YAML + env configuration for tailswarm. The
-// loader populates it from a YAML file, overlays environment variables
-// (env wins, per DESIGN.md §6), and then validates.
+// Config is the merged YAML + env configuration for tailswarm.
 type Config struct {
 	Headscale          HeadscaleConfig `yaml:"headscale"`
-	Sidecar            SidecarConfig   `yaml:"sidecar"`
+	Tsnet              TsnetConfig     `yaml:"tsnet"`
 	Reconcile          ReconcileConfig `yaml:"reconcile"`
 	LabelNamespace     string          `yaml:"label_namespace"`
 	AllowedTagPrefixes []string        `yaml:"allowed_tag_prefixes"`
+
+	// Network is the shared overlay tailswarm and managed services join.
+	// Defaults to "tailswarm-overlay". Per-service tailswarm.network
+	// labels override this for the edge case where a service can't be
+	// moved onto the shared overlay.
+	Network string `yaml:"network"`
 }
 
 // HeadscaleConfig groups the controller-side knobs.
-//
-// APIKey is never read from YAML directly; operators provide either
-// APIKeyFile (typically a Docker secret mount) which is read once at
-// load time, or the TAILSWARM_HEADSCALE_API_KEY env var.
 type HeadscaleConfig struct {
 	URL           string        `yaml:"url"`
 	APIKey        string        `yaml:"-"`
@@ -36,28 +36,23 @@ type HeadscaleConfig struct {
 	KeyExpiration time.Duration `yaml:"key_expiration"`
 }
 
-// SidecarConfig groups sidecar-image knobs.
-type SidecarConfig struct {
-	Image string `yaml:"image"`
+// TsnetConfig groups in-process tailnet knobs.
+type TsnetConfig struct {
+	// StateDir is the on-disk root under which each tsnet server
+	// persists its node identity (one subdirectory per hostname).
+	// Should map to a named volume so identities survive restarts.
+	StateDir string `yaml:"state_dir"`
 }
 
-// ReconcileConfig groups loop-tuning knobs.
 type ReconcileConfig struct {
 	FullResyncInterval time.Duration `yaml:"full_resync_interval"`
 	RateLimitRPS       float64       `yaml:"rate_limit_rps"`
 }
 
-// labelNamespacePattern matches the allowed shape for label_namespace —
-// the part of "<ns>.enable" before the dot. Lower-case alnum and dashes,
-// at least one character.
 var labelNamespacePattern = regexp.MustCompile(`^[a-z0-9-]+$`)
 
 // Load reads tailswarm configuration from a YAML file and overlays
-// environment variables on top. env is injected (rather than calling
-// os.Getenv directly) so tests can provide an isolated environment.
-//
-// path may be empty, in which case the YAML step is skipped and the
-// config comes entirely from env + defaults.
+// environment variables. env wins over YAML.
 func Load(path string, env func(string) string) (Config, error) {
 	if env == nil {
 		env = os.Getenv
@@ -70,8 +65,6 @@ func Load(path string, env func(string) string) (Config, error) {
 		if err != nil {
 			return Config{}, fmt.Errorf("read config %s: %w", path, err)
 		}
-		// Decode into a fresh Config so explicitly-set zero values from
-		// YAML don't get clobbered by the defaults — then merge.
 		var fromFile Config
 		dec := yaml.NewDecoder(strings.NewReader(string(raw)))
 		dec.KnownFields(true)
@@ -104,18 +97,18 @@ func defaultConfig() Config {
 		Headscale: HeadscaleConfig{
 			KeyExpiration: 5 * time.Minute,
 		},
+		Tsnet: TsnetConfig{
+			StateDir: "/var/lib/tailswarm",
+		},
 		Reconcile: ReconcileConfig{
 			FullResyncInterval: 30 * time.Second,
 			RateLimitRPS:       5,
 		},
 		LabelNamespace: defaultNamespace,
+		Network:        defaultOverlay,
 	}
 }
 
-// mergeConfig overlays src onto dst: any non-zero field in src replaces
-// the corresponding field in dst. Slices are replaced wholesale rather
-// than appended, so an operator who explicitly sets allowed_tag_prefixes
-// to [] gets exactly that.
 func mergeConfig(dst, src Config) Config {
 	if src.Headscale.URL != "" {
 		dst.Headscale.URL = src.Headscale.URL
@@ -129,8 +122,8 @@ func mergeConfig(dst, src Config) Config {
 	if src.Headscale.KeyExpiration != 0 {
 		dst.Headscale.KeyExpiration = src.Headscale.KeyExpiration
 	}
-	if src.Sidecar.Image != "" {
-		dst.Sidecar.Image = src.Sidecar.Image
+	if src.Tsnet.StateDir != "" {
+		dst.Tsnet.StateDir = src.Tsnet.StateDir
 	}
 	if src.Reconcile.FullResyncInterval != 0 {
 		dst.Reconcile.FullResyncInterval = src.Reconcile.FullResyncInterval
@@ -144,12 +137,12 @@ func mergeConfig(dst, src Config) Config {
 	if src.AllowedTagPrefixes != nil {
 		dst.AllowedTagPrefixes = src.AllowedTagPrefixes
 	}
+	if src.Network != "" {
+		dst.Network = src.Network
+	}
 	return dst
 }
 
-// applyEnv overlays TAILSWARM_* environment variables onto cfg. env wins
-// over YAML, which is what operators expect from twelve-factor-style
-// config and what DESIGN.md §6 specifies.
 func applyEnv(cfg *Config, env func(string) string) error {
 	if v := env("TAILSWARM_HEADSCALE_URL"); v != "" {
 		cfg.Headscale.URL = v
@@ -170,8 +163,8 @@ func applyEnv(cfg *Config, env func(string) string) error {
 		}
 		cfg.Headscale.KeyExpiration = d
 	}
-	if v := env("TAILSWARM_SIDECAR_IMAGE"); v != "" {
-		cfg.Sidecar.Image = v
+	if v := env("TAILSWARM_TSNET_STATE_DIR"); v != "" {
+		cfg.Tsnet.StateDir = v
 	}
 	if v := env("TAILSWARM_RECONCILE_FULL_RESYNC_INTERVAL"); v != "" {
 		d, err := time.ParseDuration(v)
@@ -201,6 +194,9 @@ func applyEnv(cfg *Config, env func(string) string) error {
 		}
 		cfg.AllowedTagPrefixes = out
 	}
+	if v := env("TAILSWARM_NETWORK"); v != "" {
+		cfg.Network = v
+	}
 	return nil
 }
 
@@ -215,8 +211,8 @@ func (c Config) validate() error {
 	if c.Headscale.User == "" {
 		return fmt.Errorf("tailswarm: headscale.user is required")
 	}
-	if c.Sidecar.Image == "" {
-		return fmt.Errorf("tailswarm: sidecar.image is required")
+	if c.Tsnet.StateDir == "" {
+		return fmt.Errorf("tailswarm: tsnet.state_dir is required")
 	}
 	if c.Headscale.KeyExpiration <= 0 {
 		return fmt.Errorf("tailswarm: headscale.key_expiration must be positive, got %s", c.Headscale.KeyExpiration)
@@ -229,6 +225,9 @@ func (c Config) validate() error {
 	}
 	if !labelNamespacePattern.MatchString(c.LabelNamespace) {
 		return fmt.Errorf("tailswarm: label_namespace %q must match %s", c.LabelNamespace, labelNamespacePattern)
+	}
+	if c.Network == "" {
+		return fmt.Errorf("tailswarm: network is required")
 	}
 	return nil
 }

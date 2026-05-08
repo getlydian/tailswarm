@@ -12,12 +12,23 @@
 #      headscale.user to match your environment):
 #        docker config create tailswarm_config tailswarm.yml
 #
-#   3. Create the ingress overlay tailswarm uses to reach the proxy:
+#   3. Create the shared overlay every managed service joins:
+#        docker network create -d overlay --attachable tailswarm-overlay
+#
+#   4. Create the internal overlay between tailswarm and the socket proxy:
 #        docker network create -d overlay --attachable tailswarm-internal
 #
+#   5. Create the volume that holds tsnet node identities:
+#        docker volume create tailswarm-tsnet-state
+#
+# tailswarm runs an in-process tsnet.Server per opted-in service and
+# forwards TCP traffic to <stack>_<service>:<port> over the shared
+# overlay. No sidecars, no NET_ADMIN, no /dev/net/tun.
+#
 # tailswarm never touches the raw Docker socket. It talks to a
-# tecnativa/docker-socket-proxy sidecar (DESIGN.md §8) constrained to a
-# manager node, and only the API sections it actually uses are enabled.
+# tecnativa/docker-socket-proxy sidecar constrained to a manager node,
+# and only the read-side API sections are enabled — the tsnet design
+# never creates, updates, or removes Docker services.
 
 version: "3.8"
 
@@ -29,14 +40,12 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
-      # Read paths tailswarm needs.
       SERVICES: 1
       NETWORKS: 1
       TASKS: 1
       EVENTS: 1
-      # Write path — without POST, create/update/remove all 403.
-      POST: 1
-      # Everything else stays default-denied.
+      # No POST — tailswarm has no write paths in the tsnet design.
+      POST: 0
       CONTAINERS: 0
       EXEC: 0
       IMAGES: 0
@@ -62,6 +71,7 @@ services:
     image: ghcr.io/getlydian/tailswarm:edge
     networks:
       - tailswarm-internal
+      - tailswarm-overlay
     environment:
       DOCKER_HOST: tcp://docker-proxy:2375
       TAILSWARM_CONFIG: /etc/tailswarm/tailswarm.yml
@@ -71,6 +81,8 @@ services:
         target: /etc/tailswarm/tailswarm.yml
     secrets:
       - tailswarm_headscale_api_key
+    volumes:
+      - tailswarm-tsnet-state:/var/lib/tailswarm
     deploy:
       replicas: 1
       placement:
@@ -86,6 +98,8 @@ services:
 networks:
   tailswarm-internal:
     external: true
+  tailswarm-overlay:
+    external: true
 
 configs:
   tailswarm_config:
@@ -93,4 +107,8 @@ configs:
 
 secrets:
   tailswarm_headscale_api_key:
+    external: true
+
+volumes:
+  tailswarm-tsnet-state:
     external: true
