@@ -1,0 +1,96 @@
+# tailswarm itself, deployed as a Swarm stack.
+#
+#   docker stack deploy -c tailswarm-stack.yml tailswarm
+#
+# Before deploying:
+#
+#   1. Create the Headscale API token as a Docker secret:
+#        printf '%s' "$HEADSCALE_API_KEY" | \
+#          docker secret create tailswarm_headscale_api_key -
+#
+#   2. Create the YAML config as a Docker config (edit headscale.url +
+#      headscale.user to match your environment):
+#        docker config create tailswarm_config tailswarm.yml
+#
+#   3. Create the ingress overlay tailswarm uses to reach the proxy:
+#        docker network create -d overlay --attachable tailswarm-internal
+#
+# tailswarm never touches the raw Docker socket. It talks to a
+# tecnativa/docker-socket-proxy sidecar (DESIGN.md §8) constrained to a
+# manager node, and only the API sections it actually uses are enabled.
+
+version: "3.8"
+
+services:
+  docker-proxy:
+    image: tecnativa/docker-socket-proxy:0.3
+    networks:
+      - tailswarm-internal
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      # Read paths tailswarm needs.
+      SERVICES: 1
+      NETWORKS: 1
+      TASKS: 1
+      EVENTS: 1
+      # Write path — without POST, create/update/remove all 403.
+      POST: 1
+      # Everything else stays default-denied.
+      CONTAINERS: 0
+      EXEC: 0
+      IMAGES: 0
+      VOLUMES: 0
+      SECRETS: 0
+      CONFIGS: 0
+      AUTH: 0
+      SWARM: 0
+      NODES: 0
+      BUILD: 0
+      PLUGINS: 0
+      SYSTEM: 0
+      INFO: 0
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: any
+
+  tailswarm:
+    image: ghcr.io/getlydian/tailswarm:edge
+    networks:
+      - tailswarm-internal
+    environment:
+      DOCKER_HOST: tcp://docker-proxy:2375
+      TAILSWARM_CONFIG: /etc/tailswarm/tailswarm.yml
+      TAILSWARM_HEADSCALE_API_KEY_FILE: /run/secrets/tailswarm_headscale_api_key
+    configs:
+      - source: tailswarm_config
+        target: /etc/tailswarm/tailswarm.yml
+    secrets:
+      - tailswarm_headscale_api_key
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: any
+      update_config:
+        order: stop-first
+    depends_on:
+      - docker-proxy
+
+networks:
+  tailswarm-internal:
+    external: true
+
+configs:
+  tailswarm_config:
+    external: true
+
+secrets:
+  tailswarm_headscale_api_key:
+    external: true

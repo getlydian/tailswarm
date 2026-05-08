@@ -1,0 +1,51 @@
+# A tiny labeled service demonstrating every tailswarm deploy label.
+#
+#   docker network create -d overlay --attachable app-overlay
+#   docker stack deploy -c sample-app.yml billing
+#
+# Once deployed, tailswarm (running elsewhere on the swarm) will:
+#
+#   1. Mint an ephemeral Headscale pre-auth key tagged tag:billing.
+#   2. Create a sidecar service named tailswarm_<id-prefix>_billing_api
+#      attached to app-overlay, running tailscale/tailscale.
+#   3. The sidecar registers as host "billing-api" on the tailnet and
+#      advertises the 10.0.5.0/24 route.
+#
+# Stripping the tailswarm.enable label, or removing this service, makes
+# tailswarm tear the sidecar back down and expire the Headscale node.
+
+version: "3.8"
+
+services:
+  api:
+    image: nginxdemos/hello:plain-text
+    networks:
+      - app-overlay
+    deploy:
+      replicas: 1
+      labels:
+        # Required: opt the service into the tailnet.
+        tailswarm.enable: "true"
+
+        # Required when the service is on more than one overlay; here
+        # it's redundant (only app-overlay is attached) but shown for
+        # completeness.
+        tailswarm.network: "app-overlay"
+
+        # Optional: tailnet hostname. Defaults to <stack>-<service>,
+        # which would be "billing-api" anyway — shown for completeness.
+        tailswarm.hostname: "billing-api"
+
+        # Optional: ACL tag override. Must start with one of the
+        # tailswarm config's allowed_tag_prefixes (e.g. "tag:billing").
+        # If unset, the derived tag tag:swarm-api is used.
+        tailswarm.tag: "tag:billing"
+
+        # Optional: subnet routes the sidecar should advertise. Comma
+        # separated CIDRs. Headscale must approve each route before
+        # peers can use it.
+        tailswarm.advertise-routes: "10.0.5.0/24"
+
+networks:
+  app-overlay:
+    external: true
