@@ -119,7 +119,7 @@ func (f *fakeDocker) ListServices(_ context.Context, filter LabelFilter) ([]swar
 	out := make([]swarm.Service, 0, len(f.services))
 	for _, s := range f.services {
 		if filter.Key != "" {
-			v, ok := s.Spec.Annotations.Labels[filter.Key]
+			v, ok := s.Spec.Labels[filter.Key]
 			if !ok {
 				continue
 			}

@@ -85,7 +85,7 @@ func (l Labels) key(suffix string) string {
 // used to map network IDs (which is what Swarm puts on the service) to
 // human-readable names (which is what tailswarm.network references).
 func (l Labels) Parse(svc swarm.Service, networks []swarm.Network) (Target, bool, error) {
-	labels := svc.Spec.Annotations.Labels
+	labels := svc.Spec.Labels
 
 	enabled, hasEnable := labels[l.key("enable")]
 	if !hasEnable || !isTrue(enabled) {
@@ -93,7 +93,7 @@ func (l Labels) Parse(svc swarm.Service, networks []swarm.Network) (Target, bool
 	}
 
 	stack := labels[stackLabel]
-	serviceName := svc.Spec.Annotations.Name
+	serviceName := svc.Spec.Name
 	shortName := strings.TrimPrefix(serviceName, stack+"_")
 
 	overlays := userOverlays(svc, networks)
@@ -152,12 +152,14 @@ func userOverlays(svc swarm.Service, networks []swarm.Network) []string {
 	byName := make(map[string]swarm.Network, len(networks))
 	for _, n := range networks {
 		byID[n.ID] = n
-		byName[n.Spec.Annotations.Name] = n
+		byName[n.Spec.Name] = n
 	}
 
 	attached := svc.Spec.TaskTemplate.Networks
 	if len(attached) == 0 {
-		attached = svc.Spec.Networks
+		// Spec.Networks is deprecated since v1.44 but still populated by
+		// older services and engines, so accept it as a fallback.
+		attached = svc.Spec.Networks //nolint:staticcheck // back-compat with pre-v1.44 services
 	}
 
 	seen := make(map[string]struct{}, len(attached))
@@ -176,7 +178,7 @@ func userOverlays(svc swarm.Service, networks []swarm.Network) []string {
 		if n.DriverState.Name != "" && n.DriverState.Name != "overlay" {
 			continue
 		}
-		name := n.Spec.Annotations.Name
+		name := n.Spec.Name
 		if name == "" {
 			name = a.Target
 		}

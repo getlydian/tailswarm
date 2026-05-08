@@ -33,11 +33,11 @@ type fakeHeadscale struct {
 	calls  []recordedRequest
 
 	// Per-route handlers. The router dispatches by (method, pathPrefix).
-	createKey   http.HandlerFunc
-	expireKey   http.HandlerFunc
-	listNodes   http.HandlerFunc
-	deleteNode  http.HandlerFunc
-	lookupUser  http.HandlerFunc
+	createKey  http.HandlerFunc
+	expireKey  http.HandlerFunc
+	listNodes  http.HandlerFunc
+	deleteNode http.HandlerFunc
+	lookupUser http.HandlerFunc
 
 	// requireAuth, when true, makes every handler 401 without a Bearer
 	// header (in addition to the always-recorded auth header).
@@ -66,7 +66,7 @@ func newFakeHeadscale(t *testing.T) *fakeHeadscale {
 
 func (f *fakeHeadscale) route(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
-	r.Body.Close()
+	_ = r.Body.Close()
 	f.calls = append(f.calls, recordedRequest{
 		Method: r.Method,
 		Path:   r.URL.Path,
@@ -323,10 +323,10 @@ func TestHeadscale_StatusErrorTyping(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name        string
-		status      int
-		wantClient  bool
-		wantServer  bool
+		name       string
+		status     int
+		wantClient bool
+		wantServer bool
 	}{
 		{"401 unauthorized", http.StatusUnauthorized, true, false},
 		{"404 not found", http.StatusNotFound, true, false},

@@ -16,11 +16,11 @@ import (
 // loader populates it from a YAML file, overlays environment variables
 // (env wins, per DESIGN.md §6), and then validates.
 type Config struct {
-	Headscale          HeadscaleConfig  `yaml:"headscale"`
-	Sidecar            SidecarConfig    `yaml:"sidecar"`
-	Reconcile          ReconcileConfig  `yaml:"reconcile"`
-	LabelNamespace     string           `yaml:"label_namespace"`
-	AllowedTagPrefixes []string         `yaml:"allowed_tag_prefixes"`
+	Headscale          HeadscaleConfig `yaml:"headscale"`
+	Sidecar            SidecarConfig   `yaml:"sidecar"`
+	Reconcile          ReconcileConfig `yaml:"reconcile"`
+	LabelNamespace     string          `yaml:"label_namespace"`
+	AllowedTagPrefixes []string        `yaml:"allowed_tag_prefixes"`
 }
 
 // HeadscaleConfig groups the controller-side knobs.

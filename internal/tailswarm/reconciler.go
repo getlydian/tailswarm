@@ -284,7 +284,7 @@ func (r *Reconciler) Resync(ctx context.Context) error {
 	// the owner label so we don't have to grep service names.
 	live := make(map[string]swarm.Service, len(sidecars))
 	for _, sc := range sidecars {
-		targetID := sc.Spec.Annotations.Labels[ownerLabelTarget]
+		targetID := sc.Spec.Labels[ownerLabelTarget]
 		if targetID == "" {
 			r.Log.Warn("sidecar without target label; removing",
 				"sidecar_id", sc.ID)
@@ -393,7 +393,7 @@ func (r *Reconciler) sidecarVersion(ctx context.Context, sidecarID string) (uint
 
 func networkIDByName(networks []swarm.Network, name string) string {
 	for _, n := range networks {
-		if n.Spec.Annotations.Name == name {
+		if n.Spec.Name == name {
 			return n.ID
 		}
 	}

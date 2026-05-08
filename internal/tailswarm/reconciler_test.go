@@ -168,7 +168,7 @@ func TestReconcile_LabelChangeUpdatesAndExpiresOldKey(t *testing.T) {
 	// Bump the target's hostname and version: triggers a fresh plan.
 	h.docker.mu.Lock()
 	tgt := h.docker.services[id]
-	tgt.Spec.Annotations.Labels["tailswarm.hostname"] = "renamed"
+	tgt.Spec.Labels["tailswarm.hostname"] = "renamed"
 	tgt.Version.Index++
 	h.docker.mu.Unlock()
 
@@ -315,7 +315,7 @@ func TestReconcile_DisabledTargetTearsDown(t *testing.T) {
 
 	// Operator drops tailswarm.enable.
 	h.docker.mu.Lock()
-	h.docker.services[id].Spec.Annotations.Labels["tailswarm.enable"] = "false"
+	h.docker.services[id].Spec.Labels["tailswarm.enable"] = "false"
 	h.docker.mu.Unlock()
 
 	if err := h.rec.Reconcile(context.Background(), id); err != nil {

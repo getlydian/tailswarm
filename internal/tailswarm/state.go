@@ -14,11 +14,11 @@ import (
 // Headscale; this struct is a cache rebuilt on startup by the
 // reconciler's resync path.
 type Entry struct {
-	SidecarID        string
-	LastSpecHash     string
-	PreAuthKeyID     string
-	HeadscaleNodeID  string
-	LastReconcileAt  time.Time
+	SidecarID       string
+	LastSpecHash    string
+	PreAuthKeyID    string
+	HeadscaleNodeID string
+	LastReconcileAt time.Time
 }
 
 // Store is a concurrency-safe map keyed by Swarm service ID. It is

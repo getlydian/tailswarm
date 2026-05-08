@@ -168,7 +168,7 @@ func (f *fakeDocker) sidecarCount() int {
 	defer f.mu.Unlock()
 	n := 0
 	for _, s := range f.services {
-		if s.Spec.Annotations.Labels["tailswarm.managed"] == "true" {
+		if s.Spec.Labels["tailswarm.managed"] == "true" {
 			n++
 		}
 	}
@@ -181,7 +181,7 @@ func (f *fakeDocker) ListServices(_ context.Context, filter tailswarm.LabelFilte
 	out := make([]swarm.Service, 0, len(f.services))
 	for _, s := range f.services {
 		if filter.Key != "" {
-			v, ok := s.Spec.Annotations.Labels[filter.Key]
+			v, ok := s.Spec.Labels[filter.Key]
 			if !ok {
 				continue
 			}
@@ -237,7 +237,7 @@ func (f *fakeDocker) UpdateService(_ context.Context, serviceID string, version 
 		return errors.New("unknown service")
 	}
 	cur.Version.Index = version + 1
-	cur.Spec.Annotations.Labels = spec.Labels
+	cur.Spec.Labels = spec.Labels
 	return nil
 }
 
@@ -257,9 +257,8 @@ func (f *fakeDocker) ListNetworks(_ context.Context) ([]swarm.Network, error) {
 }
 
 type fakeEventStream struct {
-	mu     sync.Mutex
-	subs   []chan tailswarm.Event
-	closed bool
+	mu   sync.Mutex
+	subs []chan tailswarm.Event
 }
 
 func newFakeEventStream() *fakeEventStream { return &fakeEventStream{} }

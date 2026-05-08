@@ -53,11 +53,11 @@ func TestParse_NotEnabled(t *testing.T) {
 	t.Parallel()
 
 	cases := map[string]map[string]string{
-		"missing":    nil,
-		"empty":      {"tailswarm.enable": ""},
-		"false":      {"tailswarm.enable": "false"},
-		"non-bool":   {"tailswarm.enable": "maybe"},
-		"zero":       {"tailswarm.enable": "0"},
+		"missing":  nil,
+		"empty":    {"tailswarm.enable": ""},
+		"false":    {"tailswarm.enable": "false"},
+		"non-bool": {"tailswarm.enable": "maybe"},
+		"zero":     {"tailswarm.enable": "0"},
 	}
 
 	for name, labels := range cases {
@@ -117,7 +117,7 @@ func TestParse_MultiOverlayRequiresLabel(t *testing.T) {
 	}
 
 	// Now disambiguate via label.
-	svc.Spec.Annotations.Labels["tailswarm.network"] = "beta"
+	svc.Spec.Labels["tailswarm.network"] = "beta"
 	got, enabled, err := Labels{}.Parse(svc, networks)
 	if err != nil || !enabled {
 		t.Fatalf("expected enabled with no error, got enabled=%v err=%v", enabled, err)
@@ -168,7 +168,7 @@ func TestParse_HostnameDefaultAndOverride(t *testing.T) {
 		t.Fatalf("expected default hostname 'foo-api', got %q", got.Hostname)
 	}
 
-	svc.Spec.Annotations.Labels["tailswarm.hostname"] = "billing"
+	svc.Spec.Labels["tailswarm.hostname"] = "billing"
 	got, _, err = Labels{}.Parse(svc, networks)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)

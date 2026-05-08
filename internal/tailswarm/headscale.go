@@ -175,11 +175,11 @@ func (h *Headscale) ListNodes(ctx context.Context, user string) ([]Node, error) 
 
 	var resp struct {
 		Nodes []struct {
-			ID       string   `json:"id"`
-			Name     string   `json:"name"`
-			GivenName string  `json:"givenName"`
-			Tags     []string `json:"tags"`
-			User     struct {
+			ID        string   `json:"id"`
+			Name      string   `json:"name"`
+			GivenName string   `json:"givenName"`
+			Tags      []string `json:"tags"`
+			User      struct {
 				Name string `json:"name"`
 			} `json:"user"`
 		} `json:"nodes"`
@@ -261,7 +261,7 @@ func (h *Headscale) do(ctx context.Context, method, path string, body, out any, 
 	if err != nil {
 		return fmt.Errorf("headscale: %s: %w", op, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		excerpt, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))

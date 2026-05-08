@@ -2,9 +2,9 @@ package tailswarm
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
 	networktypes "github.com/docker/docker/api/types/network"
@@ -80,7 +80,7 @@ func (d *Docker) ListServices(ctx context.Context, filter LabelFilter) ([]swarm.
 func (d *Docker) InspectService(ctx context.Context, serviceID string) (swarm.Service, error) {
 	svc, _, err := d.api.ServiceInspectWithRaw(ctx, serviceID, swarm.ServiceInspectOptions{})
 	if err != nil {
-		if client.IsErrNotFound(err) {
+		if cerrdefs.IsNotFound(err) {
 			return swarm.Service{}, ErrServiceNotFound
 		}
 		return swarm.Service{}, err
@@ -108,7 +108,7 @@ func (d *Docker) UpdateService(ctx context.Context, serviceID string, version ui
 // the desired state is "gone".
 func (d *Docker) RemoveService(ctx context.Context, serviceID string) error {
 	if err := d.api.ServiceRemove(ctx, serviceID); err != nil {
-		if client.IsErrNotFound(err) {
+		if cerrdefs.IsNotFound(err) {
 			return nil
 		}
 		return err
@@ -171,9 +171,6 @@ func (d *Docker) Subscribe(ctx context.Context) (<-chan Event, error) {
 				}
 				id := msg.Actor.ID
 				if id == "" {
-					id = msg.ID
-				}
-				if id == "" {
 					continue
 				}
 				select {
@@ -181,14 +178,12 @@ func (d *Docker) Subscribe(ctx context.Context) (<-chan Event, error) {
 				case <-ctx.Done():
 					return
 				}
-			case err, ok := <-errs:
+			case _, ok := <-errs:
 				if !ok {
 					return
 				}
-				if err != nil && !errors.Is(err, context.Canceled) {
-					// The watcher logs at the resubscribe point; we just
-					// close to signal the stream is dead.
-				}
+				// Any error (including non-cancel) ends the subscription;
+				// the watcher logs and resubscribes from its own loop.
 				return
 			}
 		}
