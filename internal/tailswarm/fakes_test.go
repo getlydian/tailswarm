@@ -68,25 +68,11 @@ func (f *fakeDocker) addService(svc swarm.Service) string {
 	return svc.ID
 }
 
-func (f *fakeDocker) addNetwork(n swarm.Network) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.networks = append(f.networks, n)
-}
-
 func (f *fakeDocker) markMissing(id string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.missing[id] = struct{}{}
 	delete(f.services, id)
-}
-
-func (f *fakeDocker) callLog() []dockerCall {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	out := make([]dockerCall, len(f.calls))
-	copy(out, f.calls)
-	return out
 }
 
 func (f *fakeDocker) ListServices(_ context.Context, filter LabelFilter) ([]swarm.Service, error) {

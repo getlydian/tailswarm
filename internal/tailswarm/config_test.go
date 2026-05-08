@@ -14,9 +14,9 @@ func envFunc(m map[string]string) func(string) string {
 
 func TestLoadDefaultsAndEnv(t *testing.T) {
 	cfg, err := Load("", envFunc(map[string]string{
-		"TAILSWARM_HEADSCALE_URL":      "https://hs.example",
-		"TAILSWARM_HEADSCALE_USER":     "swarm",
-		"TAILSWARM_HEADSCALE_API_KEY":  "secret",
+		"TAILSWARM_HEADSCALE_URL":     "https://hs.example",
+		"TAILSWARM_HEADSCALE_USER":    "swarm",
+		"TAILSWARM_HEADSCALE_API_KEY": "secret",
 	}))
 	if err != nil {
 		t.Fatalf("load: %v", err)
