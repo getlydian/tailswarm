@@ -81,7 +81,9 @@ func NewTsnetProxy(ctx context.Context, cfg ProxyConfig, log *slog.Logger) (*Pro
 	}
 
 	if err := srv.Start(); err != nil {
-		_ = srv.Close()
+		if log != nil {
+			log.Error("tsnet start failed", "hostname", cfg.Hostname, "err", err)
+		}
 		return nil, fmt.Errorf("tsnet start %s: %w", cfg.Hostname, err)
 	}
 
