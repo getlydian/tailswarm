@@ -50,21 +50,23 @@ type Target struct {
 // run a second tailswarm instance side-by-side reading
 // "tailswarm-stage.enable" labels.
 //
-// AllowedTagPrefixes is the allowlist used to validate user-supplied
-// tailswarm.tag overrides. The default derived tag (tag:swarm-<service>)
-// is always permitted regardless of this allowlist.
+// AllowedTags is the allowlist used to validate user-supplied
+// tailswarm.tag overrides. Each entry is a whole-tag glob: `*` matches
+// any run of characters, anchored at both ends. The default derived tag
+// (tag:swarm-<service>) is always permitted regardless of this
+// allowlist.
 //
 // DefaultNetwork overrides the built-in "tailswarm-overlay" default. The
 // reconciler injects the configured shared overlay name here.
 type Labels struct {
-	Namespace          string
-	AllowedTagPrefixes []string
-	DefaultNetwork     string
+	Namespace      string
+	AllowedTags    []string
+	DefaultNetwork string
 }
 
 var (
 	ErrUnknownNetwork = errors.New("tailswarm: tailswarm.network does not match any of the service's networks")
-	ErrTagNotAllowed  = errors.New("tailswarm: tailswarm.tag is not in the allowed prefix list")
+	ErrTagNotAllowed  = errors.New("tailswarm: tailswarm.tag does not match any allowed_tags pattern")
 	ErrNoTCPPorts     = errors.New("tailswarm: service has no TCP ports in its endpoint spec")
 )
 
@@ -128,7 +130,7 @@ func (l Labels) Parse(svc swarm.Service, networks []swarm.Network) (Target, bool
 	derivedTag := "tag:swarm-" + shortName
 	tag := derivedTag
 	if override, ok := labels[l.key("tag")]; ok && override != "" {
-		if !tagAllowed(override, derivedTag, l.AllowedTagPrefixes) {
+		if !tagAllowed(override, derivedTag, l.AllowedTags) {
 			return Target{}, true, fmt.Errorf("%w: %q", ErrTagNotAllowed, override)
 		}
 		tag = override
@@ -208,14 +210,37 @@ func tcpPorts(svc swarm.Service) []Port {
 	return out
 }
 
-func tagAllowed(tag, derived string, allowedPrefixes []string) bool {
+func tagAllowed(tag, derived string, allowedTags []string) bool {
 	if tag == derived {
 		return true
 	}
-	for _, p := range allowedPrefixes {
-		if strings.HasPrefix(tag, p) {
+	for _, p := range allowedTags {
+		if matchGlob(p, tag) {
 			return true
 		}
 	}
 	return false
+}
+
+// matchGlob reports whether s matches pattern. The only metacharacter is
+// `*`, which matches any (possibly empty) run of characters. The match is
+// anchored at both ends, so the pattern must consume the whole string.
+func matchGlob(pattern, s string) bool {
+	parts := strings.Split(pattern, "*")
+	if len(parts) == 1 {
+		return pattern == s
+	}
+	if !strings.HasPrefix(s, parts[0]) {
+		return false
+	}
+	s = s[len(parts[0]):]
+	last := parts[len(parts)-1]
+	for _, mid := range parts[1 : len(parts)-1] {
+		i := strings.Index(s, mid)
+		if i < 0 {
+			return false
+		}
+		s = s[i+len(mid):]
+	}
+	return strings.HasSuffix(s, last)
 }

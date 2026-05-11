@@ -62,7 +62,7 @@ func TestLabelsParseDefaults(t *testing.T) {
 }
 
 func TestLabelsParseTagAllowlist(t *testing.T) {
-	l := Labels{AllowedTagPrefixes: []string{"tag:billing"}}
+	l := Labels{AllowedTags: []string{"tag:billing"}}
 	svc := swarm.Service{
 		Spec: swarm.ServiceSpec{
 			Annotations: swarm.Annotations{
@@ -80,6 +80,40 @@ func TestLabelsParseTagAllowlist(t *testing.T) {
 	_, _, err := l.Parse(svc, nil)
 	if !errors.Is(err, ErrTagNotAllowed) {
 		t.Fatalf("got %v want ErrTagNotAllowed", err)
+	}
+}
+
+func TestTagAllowedGlob(t *testing.T) {
+	cases := []struct {
+		name    string
+		allowed []string
+		tag     string
+		want    bool
+	}{
+		{"exact literal matches", []string{"tag:tool-headscale-ui"}, "tag:tool-headscale-ui", true},
+		{"literal does not prefix-match", []string{"tag:tool-headscale-ui"}, "tag:tool-headscale-ui-extra", false},
+		{"middle star matches", []string{"tag:tool-*-lydian"}, "tag:tool-traefik-tailnet-lydian", true},
+		{"middle star anchored on suffix", []string{"tag:tool-*-lydian"}, "tag:tool-foo-lydian-extra", false},
+		{"middle star requires suffix", []string{"tag:tool-*-lydian"}, "tag:tool-foo-kulmin", false},
+		{"trailing star matches anything", []string{"tag:tool-*"}, "tag:tool-anything-here", true},
+		{"leading star matches", []string{"*-lydian"}, "tag:tool-foo-lydian", true},
+		{"unrelated tag rejected", []string{"tag:tool-*-lydian"}, "tag:svc-redis-ops-lydian", false},
+		{"multiple stars", []string{"tag:*-*-lydian"}, "tag:tool-traefik-lydian", true},
+		{"empty allowlist rejects override", nil, "tag:anything", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tagAllowed(tc.tag, "tag:swarm-derived-never-matches", tc.allowed)
+			if got != tc.want {
+				t.Errorf("tagAllowed(%q, allowed=%v) = %v, want %v", tc.tag, tc.allowed, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTagAllowedDerivedAlwaysOK(t *testing.T) {
+	if !tagAllowed("tag:swarm-api", "tag:swarm-api", nil) {
+		t.Fatal("derived tag must be allowed regardless of allowlist")
 	}
 }
 

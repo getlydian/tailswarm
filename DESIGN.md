@@ -231,7 +231,7 @@ prod tailnets) by reading e.g. `tailswarm-stage.enable=true`.
   only need to live long enough for the sidecar to come up and register).
 - ACL tags are namespaced (`tag:swarm-<service>`) so a compromised
   sidecar can't impersonate a tag it wasn't granted; the `tailswarm.tag`
-  label only narrows or remaps within an allowlist (`allowed_tag_prefixes`
+  label only narrows or remaps within an allowlist (`allowed_tags`
   in tailswarm config).
 - tailswarm needs Docker API access from a manager node. Mounting
   `docker.sock` directly works but gives the daemon root-equivalent

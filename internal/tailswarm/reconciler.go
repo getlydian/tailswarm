@@ -103,9 +103,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, serviceID string) error {
 	}
 
 	parser := Labels{
-		Namespace:          r.Cfg.LabelNamespace,
-		AllowedTagPrefixes: r.Cfg.AllowedTagPrefixes,
-		DefaultNetwork:     r.Cfg.Network,
+		Namespace:      r.Cfg.LabelNamespace,
+		AllowedTags:    r.Cfg.AllowedTags,
+		DefaultNetwork: r.Cfg.Network,
 	}
 	tgt, enabled, err := parser.Parse(target, networks)
 	if err != nil {

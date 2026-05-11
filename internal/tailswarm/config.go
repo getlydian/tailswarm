@@ -17,8 +17,8 @@ type Config struct {
 	Headscale          HeadscaleConfig `yaml:"headscale"`
 	Tsnet              TsnetConfig     `yaml:"tsnet"`
 	Reconcile          ReconcileConfig `yaml:"reconcile"`
-	LabelNamespace     string          `yaml:"label_namespace"`
-	AllowedTagPrefixes []string        `yaml:"allowed_tag_prefixes"`
+	LabelNamespace string          `yaml:"label_namespace"`
+	AllowedTags    []string        `yaml:"allowed_tags"`
 
 	// Network is the shared overlay tailswarm and managed services join.
 	// Defaults to "tailswarm-overlay". Per-service tailswarm.network
@@ -134,8 +134,8 @@ func mergeConfig(dst, src Config) Config {
 	if src.LabelNamespace != "" {
 		dst.LabelNamespace = src.LabelNamespace
 	}
-	if src.AllowedTagPrefixes != nil {
-		dst.AllowedTagPrefixes = src.AllowedTagPrefixes
+	if src.AllowedTags != nil {
+		dst.AllowedTags = src.AllowedTags
 	}
 	if src.Network != "" {
 		dst.Network = src.Network
@@ -183,7 +183,7 @@ func applyEnv(cfg *Config, env func(string) string) error {
 	if v := env("TAILSWARM_LABEL_NAMESPACE"); v != "" {
 		cfg.LabelNamespace = v
 	}
-	if v := env("TAILSWARM_ALLOWED_TAG_PREFIXES"); v != "" {
+	if v := env("TAILSWARM_ALLOWED_TAGS"); v != "" {
 		parts := strings.Split(v, ",")
 		out := make([]string, 0, len(parts))
 		for _, p := range parts {
@@ -192,7 +192,7 @@ func applyEnv(cfg *Config, env func(string) string) error {
 				out = append(out, p)
 			}
 		}
-		cfg.AllowedTagPrefixes = out
+		cfg.AllowedTags = out
 	}
 	if v := env("TAILSWARM_NETWORK"); v != "" {
 		cfg.Network = v

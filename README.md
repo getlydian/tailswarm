@@ -92,7 +92,7 @@ Configuration is YAML plus environment variables. Env wins.
 | `reconcile.full_resync_interval`  | `TAILSWARM_RECONCILE_FULL_RESYNC_INTERVAL`| `30s`               | Period of the safety-net full list, on top of event-driven reconciles.            |
 | `reconcile.rate_limit_rps`        | `TAILSWARM_RECONCILE_RATE_LIMIT_RPS`      | `5`                 | Global cap on Headscale API calls per second.                                     |
 | `label_namespace`                 | `TAILSWARM_LABEL_NAMESPACE`               | `tailswarm`         | Label prefix. Set to e.g. `tailswarm-stage` to run two daemons against one Swarm. |
-| `allowed_tag_prefixes`            | `TAILSWARM_ALLOWED_TAG_PREFIXES`          | —                   | Comma-separated list of ACL-tag prefixes a service is allowed to request.         |
+| `allowed_tags`                    | `TAILSWARM_ALLOWED_TAGS`                  | —                   | Comma-separated list of whole-tag glob patterns a service is allowed to request. `*` matches any run of characters; patterns are anchored at both ends. |
 
 The daemon also reads `TAILSWARM_CONFIG` for the path to the YAML file
 and `DOCKER_HOST` for the Docker endpoint (set to the socket proxy in
@@ -104,7 +104,7 @@ the example stack).
 | -------------------- | -------- | ------------------------ | ---------------------------------------------------------------------------------------------------- |
 | `tailswarm.enable`   | yes      | —                        | Must be `"true"` for tailswarm to bring up a tsnet server.                                           |
 | `tailswarm.hostname` | no       | `<stack>-<service>`      | Tailnet hostname.                                                                                    |
-| `tailswarm.tag`      | no       | `tag:swarm-<service>`    | ACL tag override. Must start with one of the daemon's `allowed_tag_prefixes`.                        |
+| `tailswarm.tag`      | no       | `tag:swarm-<service>`    | ACL tag override. Must match one of the daemon's `allowed_tags` patterns.                            |
 | `tailswarm.network`  | no       | shared overlay           | Override the shared overlay for the edge case where a service can't join `tailswarm-overlay`.        |
 
 Ports are sourced automatically from the service's `EndpointSpec.Ports`
@@ -136,7 +136,7 @@ no `/dev/net/tun`, and no privileged flags. Pre-auth keys are minted
 with a short expiry (default 5 minutes — long enough for tsnet to
 register, no longer) and are never logged. ACL tags are namespaced as
 `tag:swarm-<service>` by default; the `tailswarm.tag` label can only
-narrow within `allowed_tag_prefixes`.
+narrow within `allowed_tags`.
 
 ## Failure modes
 

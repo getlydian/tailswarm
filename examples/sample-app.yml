@@ -38,8 +38,8 @@ services:
         # which would be "billing-api" anyway — shown for completeness.
         tailswarm.hostname: "billing-api"
 
-        # Optional: ACL tag override. Must start with one of the
-        # tailswarm config's allowed_tag_prefixes (e.g. "tag:billing").
+        # Optional: ACL tag override. Must match one of the tailswarm
+        # config's allowed_tags glob patterns (e.g. "tag:billing").
         # If unset, the derived tag tag:swarm-api is used.
         tailswarm.tag: "tag:billing"
 
