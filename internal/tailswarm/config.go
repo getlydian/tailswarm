@@ -14,9 +14,9 @@ import (
 
 // Config is the merged YAML + env configuration for tailswarm.
 type Config struct {
-	Headscale          HeadscaleConfig `yaml:"headscale"`
-	Tsnet              TsnetConfig     `yaml:"tsnet"`
-	Reconcile          ReconcileConfig `yaml:"reconcile"`
+	Headscale      HeadscaleConfig `yaml:"headscale"`
+	Tsnet          TsnetConfig     `yaml:"tsnet"`
+	Reconcile      ReconcileConfig `yaml:"reconcile"`
 	LabelNamespace string          `yaml:"label_namespace"`
 	AllowedTags    []string        `yaml:"allowed_tags"`
 
