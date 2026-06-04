@@ -10,6 +10,7 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -215,17 +216,21 @@ func (r *Reconciler) reconcileIngress(ctx context.Context, serviceID string, tgt
 	return nil
 }
 
-// reconcileEgress drives the egress gateway lifecycle for a service:
+// reconcileEgress drives the egress gateway lifecycle for a service. There
+// is one gateway Docker service per egress target (see GatewayRef), so this
+// is a set-reconcile keyed on each target's "host:port" addr:
 //
-//  1. Not egressing → tear down any stale gateway (without touching the
+//  1. Not egressing → tear down all stale gateways (without touching the
 //     ingress proxy) and return.
-//  2. Hash the desired gateway spec; matching the live one → no-op.
-//  3. Mint a fresh ephemeral key under the app's egress.tag (rate-limited).
-//  4. Create the gateway (first time) or update it in place (label change),
-//     then expire the previous key.
+//  2. Hash the desired target set; if it matches and every desired gateway
+//     is already tracked → no-op.
+//  3. Otherwise diff desired targets against the tracked gateways:
+//     added targets get a fresh key + new gateway; removed targets are
+//     deleted and their key expired; surviving targets are left running
+//     untouched (no key churn on unrelated targets).
 //
-// The gateway is a managed Docker service, so unlike ingress this writes to
-// the Docker socket (Create/Update/Remove) — the only place tailswarm does.
+// The gateways are managed Docker services, so unlike ingress this writes to
+// the Docker socket (Create/Remove) — the only place tailswarm does.
 func (r *Reconciler) reconcileEgress(ctx context.Context, serviceID string, tgt Target) error {
 	if tgt.Egress == nil {
 		return r.teardownEgress(ctx, serviceID)
@@ -237,15 +242,128 @@ func (r *Reconciler) reconcileEgress(ctx context.Context, serviceID string, tgt 
 	eg := tgt.Egress
 	desiredHash := gatewayHash(eg, r.GatewayImage)
 
-	prev, hadPrev := r.Store.Get(serviceID)
-	if hadPrev && prev.GatewayHash == desiredHash && prev.GatewayServiceID != "" {
-		prev.LastReconcileAt = time.Now()
-		r.Store.Put(serviceID, prev)
-		return nil
+	prev, _ := r.Store.Get(serviceID)
+
+	// Index the gateways we already track by target addr, adopting any
+	// still-running-but-untracked gateways (e.g. after a daemon restart)
+	// before we diff so we don't recreate duplicates.
+	tracked, err := r.trackedGateways(ctx, serviceID, prev)
+	if err != nil {
+		return err
 	}
 
+	desired := make(map[string]EgressTarget, len(eg.Targets))
+	for _, t := range eg.Targets {
+		desired[t.addr()] = t
+	}
+
+	// Fast path: target set unchanged and every desired gateway is tracked.
+	if prev.GatewayHash == desiredHash && len(tracked) == len(desired) {
+		allTracked := true
+		for addr := range desired {
+			if _, ok := tracked[addr]; !ok {
+				allTracked = false
+				break
+			}
+		}
+		if allTracked {
+			prev.LastReconcileAt = time.Now()
+			r.Store.Put(serviceID, prev)
+			return nil
+		}
+	}
+
+	var errs []error
+
+	// Remove gateways whose target is no longer desired.
+	for addr, ref := range tracked {
+		if _, keep := desired[addr]; keep {
+			continue
+		}
+		if err := r.removeGateway(ctx, serviceID, ref); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		delete(tracked, addr)
+	}
+
+	// Create gateways for newly desired targets. Surviving gateways are left
+	// running with their existing key — no churn on unrelated targets.
+	for addr, t := range desired {
+		if _, exists := tracked[addr]; exists {
+			continue
+		}
+		ref, err := r.createGateway(ctx, serviceID, eg, t)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		tracked[addr] = ref
+	}
+
+	// Persist the surviving + new gateway set and the desired hash. The hash
+	// is recorded even on partial failure: any target that failed is absent
+	// from tracked, so the count check on the next pass forces a retry.
+	next := prev
+	next.Gateways = sortedGateways(tracked)
+	next.GatewayHash = desiredHash
+	next.LastReconcileAt = time.Now()
+	r.Store.Put(serviceID, next)
+
+	r.Log.Info("reconciled egress",
+		"service_id", serviceID,
+		"gateways", len(next.Gateways),
+		"targets", len(desired),
+		"hash", desiredHash)
+	return errors.Join(errs...)
+}
+
+// trackedGateways returns the live gateways for serviceID keyed by target
+// addr. It starts from the store's records and, if any are missing, adopts
+// still-running gateways found by their marker label (a daemon restart
+// leaves gateways running but drops the store). Adopted gateways are matched
+// back to their target by the single addr in TAILSWARM_GATEWAY_TARGETS.
+func (r *Reconciler) trackedGateways(ctx context.Context, serviceID string, prev Entry) (map[string]GatewayRef, error) {
+	out := make(map[string]GatewayRef, len(prev.Gateways))
+	for _, ref := range prev.Gateways {
+		out[ref.Target] = ref
+	}
+
+	// Adopt any running gateway not already accounted for. We list once and
+	// only fold in services whose target we aren't already tracking.
+	gws, err := r.findGateways(ctx, serviceID)
+	if err != nil {
+		return nil, fmt.Errorf("find gateways for %s: %w", serviceID, err)
+	}
+	bySvc := make(map[string]struct{}, len(out))
+	for _, ref := range out {
+		bySvc[ref.ServiceID] = struct{}{}
+	}
+	for _, gw := range gws {
+		if _, known := bySvc[gw.ID]; known {
+			continue
+		}
+		addr := gatewayTargetAddr(gw)
+		if addr == "" {
+			continue
+		}
+		if _, dup := out[addr]; dup {
+			continue
+		}
+		// Adopted without a tracked key: it was minted by a prior daemon and
+		// is ephemeral, so it lapses on its own if this gateway is later
+		// removed. KeyID stays empty; removeGateway tolerates that.
+		out[addr] = GatewayRef{Target: addr, ServiceID: gw.ID}
+	}
+	return out, nil
+}
+
+// createGateway mints an ephemeral key under the app's egress.tag and
+// creates the gateway service for a single target, rolling the key back on
+// failure.
+func (r *Reconciler) createGateway(ctx context.Context, serviceID string, eg *EgressSpec, t EgressTarget) (GatewayRef, error) {
 	if err := r.Limiter.Wait(ctx); err != nil {
-		return fmt.Errorf("rate limit: %w", err)
+		return GatewayRef{}, fmt.Errorf("rate limit: %w", err)
 	}
 	key, err := r.Ctrl.CreateEphemeralKey(ctx, KeyRequest{
 		User:       r.Cfg.Headscale.User,
@@ -255,82 +373,81 @@ func (r *Reconciler) reconcileEgress(ctx context.Context, serviceID string, tgt 
 		Expiration: r.Cfg.Headscale.KeyExpiration,
 	})
 	if err != nil {
-		return fmt.Errorf("mint egress key: %w", err)
+		return GatewayRef{}, fmt.Errorf("mint egress key for %s: %w", t.addr(), err)
 	}
 
-	spec := gatewaySpec(eg, serviceID, r.Cfg, r.GatewayImage, key.Secret)
+	spec := gatewaySpec(eg, t, serviceID, r.Cfg, r.GatewayImage, key.Secret)
+	id, err := r.Docker.CreateService(ctx, spec)
+	if err != nil {
+		r.expireOrLog(ctx, key.ID, "rollback after gateway create failure")
+		return GatewayRef{}, fmt.Errorf("create gateway for %s target %s: %w", serviceID, t.addr(), err)
+	}
+	return GatewayRef{Target: t.addr(), ServiceID: id, KeyID: key.ID}, nil
+}
 
-	gatewayID := prev.GatewayServiceID
-	if gatewayID == "" {
-		// No gateway tracked in the store. After a daemon restart the
-		// gateway may still exist on the swarm (it outlives the daemon);
-		// adopt it by its marker label rather than creating a duplicate
-		// (Docker rejects a second service with the same name).
-		if adopted, err := r.findGateway(ctx, serviceID); err != nil {
-			r.expireOrLog(ctx, key.ID, "rollback after gateway lookup failure")
-			return fmt.Errorf("find gateway for %s: %w", serviceID, err)
-		} else if adopted != "" {
-			gatewayID = adopted
+// removeGateway deletes one gateway service and expires its key (best
+// effort, rate-limited). A zero KeyID (an adopted gateway) is tolerated.
+func (r *Reconciler) removeGateway(ctx context.Context, serviceID string, ref GatewayRef) error {
+	if err := r.Limiter.Wait(ctx); err != nil {
+		return err
+	}
+	if err := r.Docker.RemoveService(ctx, ref.ServiceID); err != nil && !errors.Is(err, ErrServiceNotFound) {
+		r.Log.Warn("remove gateway", "service_id", serviceID,
+			"gateway_id", ref.ServiceID, "target", ref.Target, "err", err)
+		return fmt.Errorf("remove gateway %s: %w", ref.ServiceID, err)
+	}
+	if ref.KeyID != "" {
+		if err := r.Limiter.Wait(ctx); err != nil {
+			return err
 		}
+		r.expireOrLog(ctx, ref.KeyID, "removed egress target")
 	}
-	if gatewayID != "" {
-		// Update the existing gateway in place. Swarm rejects stale writes,
-		// so inspect for the current version first.
-		gw, err := r.Docker.InspectService(ctx, gatewayID)
-		if errors.Is(err, ErrServiceNotFound) {
-			// Gateway vanished out from under us — fall back to recreate.
-			gatewayID = ""
-		} else if err != nil {
-			r.expireOrLog(ctx, key.ID, "rollback after gateway inspect failure")
-			return fmt.Errorf("inspect gateway %s: %w", gatewayID, err)
-		} else if err := r.Docker.UpdateService(ctx, gatewayID, gw.Version.Index, spec); err != nil {
-			r.expireOrLog(ctx, key.ID, "rollback after gateway update failure")
-			return fmt.Errorf("update gateway %s: %w", gatewayID, err)
-		}
-	}
-	if gatewayID == "" {
-		id, err := r.Docker.CreateService(ctx, spec)
-		if err != nil {
-			r.expireOrLog(ctx, key.ID, "rollback after gateway create failure")
-			return fmt.Errorf("create gateway for %s: %w", serviceID, err)
-		}
-		gatewayID = id
-	}
-
-	// Swap in the new gateway state, carrying ingress fields untouched.
-	next := prev
-	next.GatewayServiceID = gatewayID
-	next.GatewayHash = desiredHash
-	next.GatewayKeyID = key.ID
-	next.LastReconcileAt = time.Now()
-	r.Store.Put(serviceID, next)
-
-	if hadPrev && prev.GatewayKeyID != "" && prev.GatewayKeyID != key.ID {
-		r.expireOrLog(ctx, prev.GatewayKeyID, "rotated egress key")
-	}
-	r.Log.Info("reconciled egress",
-		"service_id", serviceID,
-		"gateway_id", gatewayID,
-		"hostname", eg.Hostname,
-		"hash", desiredHash)
 	return nil
 }
 
-// findGateway returns the service ID of an existing gateway fronting
-// appServiceID, or "" if none exists. It matches on the gatewayForLabel
-// marker so a daemon restart adopts a still-running gateway instead of
-// creating a duplicate.
-func (r *Reconciler) findGateway(ctx context.Context, appServiceID string) (string, error) {
+// sortedGateways flattens the keyed gateway set into a slice ordered by
+// target addr, so the stored Entry is stable across reconciles.
+func sortedGateways(m map[string]GatewayRef) []GatewayRef {
+	out := make([]GatewayRef, 0, len(m))
+	for _, ref := range m {
+		out = append(out, ref)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Target < out[j].Target })
+	return out
+}
+
+// findGateways returns every gateway service fronting appServiceID, matched
+// on the gatewayForLabel marker, so a daemon restart adopts the whole set
+// instead of creating duplicates.
+func (r *Reconciler) findGateways(ctx context.Context, appServiceID string) ([]swarm.Service, error) {
 	gws, err := r.Docker.ListServices(ctx, LabelFilter{Key: gatewayForLabel, Value: appServiceID})
 	if err != nil {
-		return "", err
+		return nil, err
 	}
+	out := gws[:0]
 	for _, gw := range gws {
 		if gw.Spec.Labels[gatewayForLabel] == appServiceID {
-			return gw.ID, nil
+			out = append(out, gw)
 		}
 	}
-	return "", nil
+	return out, nil
+}
+
+// gatewayTargetAddr reads the single target addr a gateway fronts from its
+// TAILSWARM_GATEWAY_TARGETS env, used to re-key an adopted gateway back to
+// its target. Returns "" if the env is absent.
+func gatewayTargetAddr(gw swarm.Service) string {
+	cs := gw.Spec.TaskTemplate.ContainerSpec
+	if cs == nil {
+		return ""
+	}
+	prefix := envGatewayTargets + "="
+	for _, e := range cs.Env {
+		if strings.HasPrefix(e, prefix) {
+			return strings.TrimPrefix(e, prefix)
+		}
+	}
+	return ""
 }
 
 // teardown removes every artefact we know about for serviceID — both the
@@ -377,7 +494,7 @@ func (r *Reconciler) teardownIngress(ctx context.Context, serviceID string) erro
 	prev.Proxy = nil
 	prev.LastSpecHash = ""
 	prev.PreAuthKeyID = ""
-	if prev.GatewayServiceID == "" {
+	if len(prev.Gateways) == 0 {
 		r.Store.Delete(serviceID)
 	} else {
 		r.Store.Put(serviceID, prev)
@@ -385,43 +502,25 @@ func (r *Reconciler) teardownIngress(ctx context.Context, serviceID string) erro
 	return firstErr
 }
 
-// teardownEgress removes the egress gateway service for serviceID and
-// expires its preauth key, leaving any ingress proxy untouched. It clears
+// teardownEgress removes every egress gateway service for serviceID and
+// expires their preauth keys, leaving any ingress proxy untouched. It clears
 // the gateway fields from the store entry (and deletes the entry if no
-// ingress artefact remains). Each step is best-effort.
+// ingress artefact remains). Each step is best-effort; the first error wins.
 func (r *Reconciler) teardownEgress(ctx context.Context, serviceID string) error {
 	prev, ok := r.Store.Get(serviceID)
-	if !ok || (prev.GatewayServiceID == "" && prev.GatewayKeyID == "") {
+	if !ok || len(prev.Gateways) == 0 {
 		return nil
 	}
 
 	var firstErr error
-	if prev.GatewayServiceID != "" {
-		if err := r.Limiter.Wait(ctx); err != nil {
-			return err
-		}
-		if err := r.Docker.RemoveService(ctx, prev.GatewayServiceID); err != nil {
-			r.Log.Warn("remove gateway", "service_id", serviceID,
-				"gateway_id", prev.GatewayServiceID, "err", err)
+	for _, ref := range prev.Gateways {
+		if err := r.removeGateway(ctx, serviceID, ref); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
-	if prev.GatewayKeyID != "" {
-		if err := r.Limiter.Wait(ctx); err != nil {
-			return err
-		}
-		if err := r.Ctrl.ExpireKey(ctx, prev.GatewayKeyID); err != nil {
-			r.Log.Warn("expire gateway key", "service_id", serviceID,
-				"key_id", prev.GatewayKeyID, "err", err)
-			if firstErr == nil {
-				firstErr = err
-			}
-		}
-	}
 
-	prev.GatewayServiceID = ""
+	prev.Gateways = nil
 	prev.GatewayHash = ""
-	prev.GatewayKeyID = ""
 	if prev.Proxy == nil {
 		r.Store.Delete(serviceID)
 	} else {

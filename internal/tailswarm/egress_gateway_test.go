@@ -23,7 +23,7 @@ func TestGatewaySpecRunsAbsoluteEntrypoint(t *testing.T) {
 		Tsnet:     TsnetConfig{StateDir: "/var/lib/tailswarm"},
 	}
 
-	spec := gatewaySpec(eg, "app-service-id", cfg, "ghcr.io/getlydian/tailswarm:test", "authkey")
+	spec := gatewaySpec(eg, eg.Targets[0], "app-service-id", cfg, "ghcr.io/getlydian/tailswarm:test", "authkey")
 
 	cs := spec.TaskTemplate.ContainerSpec
 	if cs == nil {
@@ -37,8 +37,10 @@ func TestGatewaySpecRunsAbsoluteEntrypoint(t *testing.T) {
 	}
 }
 
-// gatewaySpec wires the EgressSpec through into the env contract,
-// network alias, marker label, and image the gateway needs to run.
+// gatewaySpec wires one target through into the env contract, network
+// alias, marker label, and image the gateway needs to run. There is one
+// gateway per target: its spec carries the single target's addr and the
+// single host as an alias, under a per-target hostname.
 func TestGatewaySpecContract(t *testing.T) {
 	eg := &EgressSpec{
 		Hostname: "thanos-query-lydian-egress",
@@ -54,7 +56,8 @@ func TestGatewaySpecContract(t *testing.T) {
 		Tsnet:     TsnetConfig{StateDir: "/var/lib/tailswarm"},
 	}
 
-	spec := gatewaySpec(eg, "query-svc-id", cfg, "img:tag", "secret-key")
+	target := eg.Targets[0]
+	spec := gatewaySpec(eg, target, "query-svc-id", cfg, "img:tag", "secret-key")
 
 	// Image + marker label.
 	if got := spec.TaskTemplate.ContainerSpec.Image; got != "img:tag" {
@@ -68,25 +71,30 @@ func TestGatewaySpecContract(t *testing.T) {
 		t.Error("gateway must not carry tailswarm.enable")
 	}
 
-	// One network attachment, on the egress overlay, aliasing every
-	// target host so overlay DNS resolves the real remote name here.
+	// Per-target service name and hostname disambiguate sibling gateways.
+	if want := "tsgw-thanos-query-lydian-egress-thanos-store-lydian"; spec.Name != want {
+		t.Errorf("service name = %q, want %q", spec.Name, want)
+	}
+
+	// One network attachment, on the egress overlay, aliasing only this
+	// gateway's single target host so overlay DNS resolves it here.
 	nets := spec.TaskTemplate.Networks
 	if len(nets) != 1 || nets[0].Target != defaultOverlay {
 		t.Fatalf("networks = %+v, want one on %s", nets, defaultOverlay)
 	}
-	wantAliases := []string{"thanos-store-lydian", "thanos-query-kulmin"}
-	if !slices.Equal(nets[0].Aliases, wantAliases) {
-		t.Errorf("aliases = %v, want %v", nets[0].Aliases, wantAliases)
+	if want := []string{"thanos-store-lydian"}; !slices.Equal(nets[0].Aliases, want) {
+		t.Errorf("aliases = %v, want %v (one per gateway)", nets[0].Aliases, want)
 	}
 
-	// Env contract the gateway entrypoint (RunGateway) reads back.
+	// Env contract the gateway entrypoint (RunGateway) reads back. Targets
+	// is the single target addr; hostname is the per-target name.
 	env := parseEnvList(spec.TaskTemplate.ContainerSpec.Env)
 	for k, want := range map[string]string{
 		envHeadscaleURL:    "https://headscale.lyops.ee",
 		envStateDir:        "/var/lib/tailswarm",
-		envGatewayHostname: "thanos-query-lydian-egress",
+		envGatewayHostname: "thanos-query-lydian-egress-thanos-store-lydian",
 		envGatewayTag:      "tag:svc-thanos-query-ops-lydian",
-		envGatewayTargets:  "thanos-store-lydian:10901,thanos-query-kulmin:10901",
+		envGatewayTargets:  "thanos-store-lydian:10901",
 		envGatewayAuthKey:  "secret-key",
 	} {
 		if env[k] != want {
@@ -95,25 +103,34 @@ func TestGatewaySpecContract(t *testing.T) {
 	}
 }
 
-// gatewaySpec deduplicates aliases when two targets share a host (e.g.
-// two ports on the same remote), since a network alias is per-host.
-func TestGatewaySpecDedupesAliases(t *testing.T) {
+// An empty authKey (the hash-only spec build) must not emit an auth-key
+// env entry.
+func TestGatewaySpecOmitsEmptyAuthKey(t *testing.T) {
 	eg := &EgressSpec{
 		Hostname: "app-egress",
 		Network:  defaultOverlay,
-		Targets: []EgressTarget{
-			{Host: "db", Port: 5432},
-			{Host: "db", Port: 5433},
-		},
+		Targets:  []EgressTarget{{Host: "db", Port: 5432}},
 	}
-	spec := gatewaySpec(eg, "id", Config{}, "img", "")
-	aliases := spec.TaskTemplate.Networks[0].Aliases
-	if want := []string{"db"}; !slices.Equal(aliases, want) {
-		t.Errorf("aliases = %v, want %v (one per host)", aliases, want)
-	}
-	// No auth key → no auth-key env entry.
+	spec := gatewaySpec(eg, eg.Targets[0], "id", Config{}, "img", "")
 	if _, ok := parseEnvList(spec.TaskTemplate.ContainerSpec.Env)[envGatewayAuthKey]; ok {
 		t.Error("empty authKey must not set the auth-key env var")
+	}
+}
+
+// gatewayHostname keeps within tailscale's length cap, falling back to a
+// truncated prefix plus a stable hash suffix for very long target names so
+// sibling gateways still get distinct hostnames.
+func TestGatewayHostnameLengthCap(t *testing.T) {
+	eg := &EgressSpec{Hostname: strings.Repeat("a", 50)}
+	long := EgressTarget{Host: strings.Repeat("b", 50), Port: 10901}
+	got := gatewayHostname(eg, long)
+	if len(got) > maxTailnetHostname {
+		t.Errorf("hostname %q len %d exceeds cap %d", got, len(got), maxTailnetHostname)
+	}
+	// Distinct targets must still yield distinct hostnames.
+	other := EgressTarget{Host: strings.Repeat("c", 50), Port: 10901}
+	if gatewayHostname(eg, other) == got {
+		t.Error("distinct long targets collapsed to the same hostname")
 	}
 }
 

@@ -26,8 +26,8 @@ level — they only see each other over the tailnet.
 That is the **inbound** path: a service is *reached* from the tailnet.
 tailswarm also supports **egress** — a service that *dials out* to
 another tailnet member by its real MagicDNS name. For each egressing
-service tailswarm deploys a companion gateway (its own image in `gateway`
-mode) that listens on the overlay and forwards out the tailnet. See
+service tailswarm deploys a companion gateway per target (its own image in
+`gateway` mode) that listens on the overlay and forwards out the tailnet. See
 [Egress (outbound) labels](#egress-outbound-labels).
 
 ## Quickstart
@@ -130,18 +130,22 @@ labels, egress labels, or both — they are independent.
 | `tailswarm.egress.enable`   | yes      | —                             | Must be `"true"` to opt the service into outbound proxying.                                                                  |
 | `tailswarm.egress.targets`  | yes      | —                             | Comma-separated `host:port` list of MagicDNS targets to reach. No local-port suffix — the app dials the real remote name.    |
 | `tailswarm.egress.tag`      | no       | `tag:swarm-<service>`         | Tailnet identity outbound connections originate as (the ACL *source*). Must match one of the daemon's `allowed_tags` patterns. |
-| `tailswarm.egress.hostname` | no       | `<stack>-<service>-egress`    | Tailnet hostname of the gateway node.                                                                                        |
+| `tailswarm.egress.hostname` | no       | `<stack>-<service>-egress`    | Base tailnet hostname; each per-target gateway appends its target host (`<base>-<target-host>`).                              |
 | `tailswarm.egress.network`  | no       | shared overlay                | Override the overlay the gateway joins.                                                                                      |
 
 The operator writes **only** these labels on the app. For each egressing
-service tailswarm derives and manages a companion **gateway** service
-(`tsgw-<egress-hostname>`) running its own image in `gateway` mode: it
-joins the overlay carrying each target host as a network alias, so
-Docker's overlay DNS resolves the real remote name to the gateway, which
-forwards the connection out the tailnet under the app's `egress.tag`. The
+service tailswarm derives and manages one companion **gateway** service
+**per target** (`tsgw-<egress-hostname>-<target-host>`) running its own
+image in `gateway` mode: each joins the overlay carrying its target host as
+a network alias, so Docker's overlay DNS resolves the real remote name to
+that gateway, which forwards the connection out the tailnet under the app's
+`egress.tag`. One gateway per target is required because Docker assigns a
+single VIP per service per network — multiple same-port targets on one
+shared gateway would collide on bind and be indistinguishable at L4. The
 app's config names the real remote host and port — no synthesized ports,
 nothing to read back. Adding a target is a one-line edit to
-`tailswarm.egress.targets`.
+`tailswarm.egress.targets`; tailswarm spins up another gateway for it and
+leaves the existing ones running.
 
 The gateway image needs no configuration: tailswarm runs the same image
 the daemon itself runs, discovered at startup from the daemon's own Swarm

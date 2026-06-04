@@ -5,14 +5,27 @@ import (
 	"time"
 )
 
+// GatewayRef tracks one egress gateway Docker service. An egressing app
+// gets one gateway per target (each target needs its own Swarm service, so
+// its own VIP/task IP — multiple same-port targets behind one container IP
+// would be indistinguishable at L4 and would collide on bind). Target is
+// the target's "host:port" addr, the stable key that survives reconciles;
+// ServiceID is the Swarm service ID (to update or remove it); KeyID is the
+// ephemeral preauth key minted under the app's egress.tag (to expire it).
+type GatewayRef struct {
+	Target    string
+	ServiceID string
+	KeyID     string
+}
+
 // Entry is the per-service bookkeeping the reconciler keeps between
 // ticks: the live tsnet proxy, the spec hash that produced it, and the
 // preauth key ID so we can expire it on rotation or teardown.
 //
 // For ingress there is no Docker-side artefact to track — the proxy *is*
 // the artefact, and lives entirely in this process. Egress is different:
-// the gateway is a managed Docker service, so its fields (below) record
-// the external artefact we must update and tear down.
+// each gateway is a managed Docker service, so its fields (below) record
+// the external artefacts we must update and tear down.
 type Entry struct {
 	Proxy           *Proxy
 	LastSpecHash    string
@@ -20,15 +33,12 @@ type Entry struct {
 	LastReconcileAt time.Time
 
 	// Egress gateway bookkeeping. Unlike the ingress Proxy (which lives in
-	// this process), the gateway is a managed Docker service: GatewayServiceID
-	// is its Swarm service ID (so we can update or remove it), GatewayHash is
-	// the spec hash that produced it (so we can detect drift), and
-	// GatewayKeyID is the preauth key minted under the app's egress.tag (so we
-	// can expire it on rotation or teardown). All three are zero for a
-	// pure-ingress service.
-	GatewayServiceID string
-	GatewayHash      string
-	GatewayKeyID     string
+	// this process), each gateway is a managed Docker service. Gateways holds
+	// one GatewayRef per egress target; GatewayHash is the hash over the whole
+	// desired target set (so we can detect drift and fast-path no-ops). Both
+	// are zero/nil for a pure-ingress service.
+	Gateways    []GatewayRef
+	GatewayHash string
 }
 
 // Store is a concurrency-safe map keyed by Swarm service ID. It owns

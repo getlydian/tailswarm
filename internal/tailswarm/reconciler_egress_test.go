@@ -3,6 +3,7 @@ package tailswarm
 import (
 	"context"
 	"errors"
+	"sort"
 	"testing"
 
 	"github.com/docker/docker/api/types/swarm"
@@ -46,6 +47,19 @@ func egressService(name, targets string) swarm.Service {
 	}
 }
 
+// gatewayAliases returns the sorted set of all overlay aliases across an
+// entry's gateways — each gateway holds exactly one. Used to assert the
+// union of targets a service fronts.
+func gatewayAliases(d *fakeDocker, e Entry) []string {
+	var out []string
+	for _, ref := range e.Gateways {
+		gw := d.services[ref.ServiceID]
+		out = append(out, gw.Spec.TaskTemplate.Networks[0].Aliases...)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func TestReconcileCreatesGateway(t *testing.T) {
 	r, d, c := testEgressReconciler(t)
 	id := d.addService(egressService("admin_phpmyadmin", "db-mysql:3306"))
@@ -84,8 +98,56 @@ func TestReconcileCreatesGateway(t *testing.T) {
 	}
 
 	e, ok := r.Store.Get(id)
-	if !ok || e.GatewayServiceID == "" || e.GatewayHash == "" || e.GatewayKeyID == "" {
-		t.Errorf("store gateway bookkeeping not set: %+v", e)
+	if !ok || len(e.Gateways) != 1 || e.GatewayHash == "" {
+		t.Fatalf("store gateway bookkeeping not set: %+v", e)
+	}
+	if g := e.Gateways[0]; g.Target != "db-mysql:3306" || g.ServiceID == "" || g.KeyID == "" {
+		t.Errorf("gateway ref not fully set: %+v", g)
+	}
+}
+
+// Each egress target gets its own gateway service, so multiple same-port
+// targets do not collide on bind (the production crash this fixes). This is
+// the regression guard for the thanos-query case (5 targets on :10901).
+func TestReconcileSamePortTargetsGetSeparateGateways(t *testing.T) {
+	r, d, c := testEgressReconciler(t)
+	const targets = "thanos-store-lydian:10901, thanos-sidecar-prd-lydian:10901, thanos-query-kulmin:10901"
+	id := d.addService(egressService("ops_thanos-query", targets))
+
+	if err := r.Reconcile(context.Background(), id); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if len(d.created) != 3 {
+		t.Fatalf("gateways created: got %d want 3 (one per same-port target)", len(d.created))
+	}
+	// Distinct service names and hostnames per gateway — the duplicate
+	// hostname/bind collision is exactly the bug.
+	names := map[string]bool{}
+	hostnames := map[string]bool{}
+	for _, spec := range d.created {
+		names[spec.Name] = true
+		hostnames[parseEnvList(spec.TaskTemplate.ContainerSpec.Env)[envGatewayHostname]] = true
+		// Each gateway forwards exactly one target.
+		if got := parseEnvList(spec.TaskTemplate.ContainerSpec.Env)[envGatewayTargets]; got == "" ||
+			len(spec.TaskTemplate.Networks[0].Aliases) != 1 {
+			t.Errorf("gateway %q is not single-target: targets=%q aliases=%+v",
+				spec.Name, got, spec.TaskTemplate.Networks[0].Aliases)
+		}
+	}
+	if len(names) != 3 {
+		t.Errorf("gateway service names not distinct: %v", names)
+	}
+	if len(hostnames) != 3 {
+		t.Errorf("gateway hostnames not distinct: %v", hostnames)
+	}
+	// One ephemeral key per gateway, all under the same egress tag.
+	if len(c.created) != 3 {
+		t.Errorf("keys minted: got %d want 3", len(c.created))
+	}
+	e, _ := r.Store.Get(id)
+	if len(e.Gateways) != 3 {
+		t.Errorf("tracked gateways: got %d want 3", len(e.Gateways))
 	}
 }
 
@@ -102,23 +164,27 @@ func TestReconcileGatewayNoOpOnUnchanged(t *testing.T) {
 	if len(d.created) != 1 {
 		t.Errorf("gateways: got %d want 1 (second reconcile should no-op)", len(d.created))
 	}
-	if len(d.updated) != 0 {
-		t.Errorf("unexpected updates: %+v", d.updated)
+	if len(d.removed) != 0 {
+		t.Errorf("unexpected removals: %+v", d.removed)
 	}
 	if len(c.created) != 1 {
 		t.Errorf("keys: got %d want 1", len(c.created))
 	}
 }
 
-func TestReconcileGatewayUpdatesOnTargetChange(t *testing.T) {
+// Adding a target creates a new gateway and leaves the surviving gateway
+// (and its key) untouched — no churn on unrelated targets.
+func TestReconcileGatewayAddsTargetLeavesSurvivors(t *testing.T) {
 	r, d, c := testEgressReconciler(t)
 	id := d.addService(egressService("admin_phpmyadmin", "db-mysql:3306"))
 
 	if err := r.Reconcile(context.Background(), id); err != nil {
 		t.Fatal(err)
 	}
+	before, _ := r.Store.Get(id)
+	survivorSvc := before.Gateways[0].ServiceID
 
-	// Add a second target. Replace the stored service.
+	// Add a second target.
 	updated := egressService("admin_phpmyadmin", "db-mysql:3306, analytics-mysql:3306")
 	updated.ID = id
 	updated.Version.Index = 2
@@ -130,22 +196,74 @@ func TestReconcileGatewayUpdatesOnTargetChange(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(d.created) != 1 {
-		t.Errorf("gateways created: got %d want 1 (update, not recreate)", len(d.created))
+	if len(d.created) != 2 {
+		t.Errorf("gateways created: got %d want 2 (one new per added target)", len(d.created))
 	}
-	if len(d.updated) != 1 {
-		t.Fatalf("gateways updated: got %d want 1", len(d.updated))
+	if len(d.removed) != 0 {
+		t.Errorf("survivor wrongly removed: %+v", d.removed)
 	}
-	// Old egress key (key-1) expired on rotation.
-	if len(c.expired) != 1 || c.expired[0] != "key-1" {
-		t.Errorf("rotated key not expired: %+v", c.expired)
+	// No key rotation: the survivor keeps key-1; only the new target mints.
+	if len(c.expired) != 0 {
+		t.Errorf("survivor key wrongly expired: %+v", c.expired)
+	}
+	if len(c.created) != 2 {
+		t.Errorf("keys minted: got %d want 2", len(c.created))
 	}
 
 	e, _ := r.Store.Get(id)
-	gw := d.services[e.GatewayServiceID]
-	aliases := gw.Spec.TaskTemplate.Networks[0].Aliases
-	if len(aliases) != 2 {
-		t.Errorf("updated aliases: %+v", aliases)
+	if want := []string{"analytics-mysql", "db-mysql"}; !equalStrings(gatewayAliases(d, e), want) {
+		t.Errorf("aliases across gateways = %v, want %v", gatewayAliases(d, e), want)
+	}
+	// Survivor still tracked with its original service ID.
+	found := false
+	for _, g := range e.Gateways {
+		if g.ServiceID == survivorSvc {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("survivor gateway %q dropped from store: %+v", survivorSvc, e.Gateways)
+	}
+}
+
+// Dropping a target removes only that gateway and expires only its key;
+// the surviving gateway is left running.
+func TestReconcileGatewayDropsTarget(t *testing.T) {
+	r, d, c := testEgressReconciler(t)
+	id := d.addService(egressService("admin_phpmyadmin", "db-mysql:3306, analytics-mysql:3306"))
+
+	if err := r.Reconcile(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := r.Store.Get(id)
+	var droppedSvc, droppedKey string
+	for _, g := range before.Gateways {
+		if g.Target == "analytics-mysql:3306" {
+			droppedSvc, droppedKey = g.ServiceID, g.KeyID
+		}
+	}
+
+	// Drop analytics-mysql.
+	updated := egressService("admin_phpmyadmin", "db-mysql:3306")
+	updated.ID = id
+	updated.Version.Index = 2
+	d.mu.Lock()
+	d.services[id] = &updated
+	d.mu.Unlock()
+
+	if err := r.Reconcile(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(d.removed) != 1 || d.removed[0] != droppedSvc {
+		t.Errorf("dropped gateway not removed: removed=%+v want [%s]", d.removed, droppedSvc)
+	}
+	if len(c.expired) != 1 || c.expired[0] != droppedKey {
+		t.Errorf("dropped key not expired: expired=%+v want [%s]", c.expired, droppedKey)
+	}
+	e, _ := r.Store.Get(id)
+	if want := []string{"db-mysql"}; !equalStrings(gatewayAliases(d, e), want) {
+		t.Errorf("aliases after drop = %v, want %v", gatewayAliases(d, e), want)
 	}
 }
 
@@ -157,7 +275,7 @@ func TestReconcileGatewayTeardownOnDisable(t *testing.T) {
 		t.Fatal(err)
 	}
 	e, _ := r.Store.Get(id)
-	gwID := e.GatewayServiceID
+	gwID := e.Gateways[0].ServiceID
 
 	d.mu.Lock()
 	d.services[id].Spec.Labels["tailswarm.egress.enable"] = "false"
@@ -186,7 +304,7 @@ func TestReconcileGatewayTeardownOnDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	e, _ := r.Store.Get(id)
-	gwID := e.GatewayServiceID
+	gwID := e.Gateways[0].ServiceID
 
 	d.markMissing(id)
 	if err := r.Reconcile(context.Background(), id); err != nil {
@@ -214,10 +332,10 @@ func TestReconcileEgressRemovedKeepsIngress(t *testing.T) {
 		t.Fatal(err)
 	}
 	e, _ := r.Store.Get(id)
-	if e.Proxy == nil || e.GatewayServiceID == "" {
+	if e.Proxy == nil || len(e.Gateways) != 1 {
 		t.Fatalf("expected both ingress and egress artefacts: %+v", e)
 	}
-	gwID := e.GatewayServiceID
+	gwID := e.Gateways[0].ServiceID
 
 	// Drop egress labels, keep ingress.
 	d.mu.Lock()
@@ -240,7 +358,7 @@ func TestReconcileEgressRemovedKeepsIngress(t *testing.T) {
 	if e.Proxy == nil {
 		t.Error("ingress proxy torn down when only egress was removed")
 	}
-	if e.GatewayServiceID != "" {
+	if len(e.Gateways) != 0 {
 		t.Errorf("gateway fields not cleared: %+v", e)
 	}
 	// The egress key was expired; the ingress key was not.
@@ -263,34 +381,42 @@ func TestReconcileEgressMissingImageErrors(t *testing.T) {
 	}
 }
 
-// After a daemon restart the store is empty but the gateway still runs;
-// the reconciler must adopt it by marker label, not create a duplicate.
+// After a daemon restart the store is empty but the gateways still run; the
+// reconciler must adopt them by marker label, not create duplicates.
 func TestReconcileGatewayAdoptedAfterRestart(t *testing.T) {
 	r, d, _ := testEgressReconciler(t)
-	id := d.addService(egressService("admin_phpmyadmin", "db-mysql:3306"))
+	id := d.addService(egressService("admin_phpmyadmin", "db-mysql:3306, analytics-mysql:3306"))
 
 	if err := r.Reconcile(context.Background(), id); err != nil {
 		t.Fatal(err)
 	}
-	e, _ := r.Store.Get(id)
-	gwID := e.GatewayServiceID
+	before, _ := r.Store.Get(id)
+	wantSvcs := map[string]bool{}
+	for _, g := range before.Gateways {
+		wantSvcs[g.ServiceID] = true
+	}
 
 	// Simulate a restart: drop all in-memory state but keep the gateway
-	// service alive on the swarm.
+	// services alive on the swarm.
 	r.Store.Delete(id)
 
 	if err := r.Reconcile(context.Background(), id); err != nil {
 		t.Fatal(err)
 	}
-	if len(d.created) != 1 {
-		t.Errorf("gateway recreated instead of adopted: created=%d", len(d.created))
+	if len(d.created) != 2 {
+		t.Errorf("gateways recreated instead of adopted: created=%d want 2 (the original create)", len(d.created))
 	}
-	if len(d.updated) != 1 {
-		t.Errorf("adopted gateway not updated in place: updated=%+v", d.updated)
+	if len(d.removed) != 0 {
+		t.Errorf("adopted gateways wrongly removed: %+v", d.removed)
 	}
 	e2, ok := r.Store.Get(id)
-	if !ok || e2.GatewayServiceID != gwID {
-		t.Errorf("adopted gateway id mismatch: got %q want %q", e2.GatewayServiceID, gwID)
+	if !ok || len(e2.Gateways) != 2 {
+		t.Fatalf("adopted gateway set wrong: %+v", e2.Gateways)
+	}
+	for _, g := range e2.Gateways {
+		if !wantSvcs[g.ServiceID] {
+			t.Errorf("adopted gateway id %q not among originals %v", g.ServiceID, wantSvcs)
+		}
 	}
 }
 
@@ -309,7 +435,21 @@ func TestReconcileGatewayCreateFailureExpiresKey(t *testing.T) {
 	if len(c.expired) != 1 || c.expired[0] != "key-1" {
 		t.Errorf("create-failure rollback didn't expire key: %+v", c.expired)
 	}
-	if _, ok := r.Store.Get(id); ok {
-		t.Error("no store entry should persist after failed create")
+	// No gateway was created, so nothing is tracked — but the store entry may
+	// exist with an empty gateway set; the next pass retries.
+	if e, ok := r.Store.Get(id); ok && len(e.Gateways) != 0 {
+		t.Errorf("failed create left a tracked gateway: %+v", e.Gateways)
 	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
