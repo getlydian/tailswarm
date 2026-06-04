@@ -60,11 +60,11 @@ func TestGatewaySpecContract(t *testing.T) {
 	if got := spec.TaskTemplate.ContainerSpec.Image; got != "img:tag" {
 		t.Errorf("Image = %q, want img:tag", got)
 	}
-	if got := spec.Annotations.Labels[gatewayForLabel]; got != "query-svc-id" {
+	if got := spec.Labels[gatewayForLabel]; got != "query-svc-id" {
 		t.Errorf("marker label = %q, want query-svc-id", got)
 	}
 	// A gateway must never be picked up as an ingress target.
-	if _, isApp := spec.Annotations.Labels["tailswarm.enable"]; isApp {
+	if _, isApp := spec.Labels["tailswarm.enable"]; isApp {
 		t.Error("gateway must not carry tailswarm.enable")
 	}
 
