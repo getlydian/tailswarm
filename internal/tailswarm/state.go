@@ -11,11 +11,15 @@ import (
 // would be indistinguishable at L4 and would collide on bind). Target is
 // the target's "host:port" addr, the stable key that survives reconciles;
 // ServiceID is the Swarm service ID (to update or remove it); KeyID is the
-// ephemeral preauth key minted under the app's egress.tag (to expire it).
+// ephemeral preauth key minted under the app's egress.tag (to expire it);
+// Hash is the per-gateway spec hash (gatewayHash) so a surviving gateway
+// whose image/tag/network drifted is updated in place rather than left
+// stale — notably across a daemon image upgrade.
 type GatewayRef struct {
 	Target    string
 	ServiceID string
 	KeyID     string
+	Hash      string
 }
 
 // Entry is the per-service bookkeeping the reconciler keeps between

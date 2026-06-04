@@ -247,7 +247,7 @@ func (r *Reconciler) reconcileEgress(ctx context.Context, serviceID string, tgt 
 	// Index the gateways we already track by target addr, adopting any
 	// still-running-but-untracked gateways (e.g. after a daemon restart)
 	// before we diff so we don't recreate duplicates.
-	tracked, err := r.trackedGateways(ctx, serviceID, prev)
+	tracked, err := r.trackedGateways(ctx, serviceID, eg, prev)
 	if err != nil {
 		return err
 	}
@@ -287,18 +287,44 @@ func (r *Reconciler) reconcileEgress(ctx context.Context, serviceID string, tgt 
 		delete(tracked, addr)
 	}
 
-	// Create gateways for newly desired targets. Surviving gateways are left
-	// running with their existing key — no churn on unrelated targets.
+	// Create gateways for newly desired targets; update surviving gateways
+	// whose spec drifted (e.g. a new image after a daemon upgrade). A
+	// surviving gateway whose hash still matches is left untouched — no churn
+	// on unrelated targets.
 	for addr, t := range desired {
-		if _, exists := tracked[addr]; exists {
+		ref, exists := tracked[addr]
+		if !exists {
+			created, err := r.createGateway(ctx, serviceID, eg, t)
+			if err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			tracked[addr] = created
 			continue
 		}
-		ref, err := r.createGateway(ctx, serviceID, eg, t)
+		if ref.Hash == targetGatewayHash(eg, t, r.GatewayImage) {
+			continue // up to date
+		}
+		updated, found, err := r.updateGateway(ctx, serviceID, eg, t, ref)
 		if err != nil {
 			errs = append(errs, err)
+			// Drop drifted-but-failed gateways from tracked so the count
+			// check forces a retry next pass.
+			delete(tracked, addr)
 			continue
 		}
-		tracked[addr] = ref
+		if !found {
+			// Vanished out from under us — recreate.
+			delete(tracked, addr)
+			created, err := r.createGateway(ctx, serviceID, eg, t)
+			if err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			tracked[addr] = created
+			continue
+		}
+		tracked[addr] = updated
 	}
 
 	// Persist the surviving + new gateway set and the desired hash. The hash
@@ -323,7 +349,7 @@ func (r *Reconciler) reconcileEgress(ctx context.Context, serviceID string, tgt 
 // still-running gateways found by their marker label (a daemon restart
 // leaves gateways running but drops the store). Adopted gateways are matched
 // back to their target by the single addr in TAILSWARM_GATEWAY_TARGETS.
-func (r *Reconciler) trackedGateways(ctx context.Context, serviceID string, prev Entry) (map[string]GatewayRef, error) {
+func (r *Reconciler) trackedGateways(ctx context.Context, serviceID string, eg *EgressSpec, prev Entry) (map[string]GatewayRef, error) {
 	out := make(map[string]GatewayRef, len(prev.Gateways))
 	for _, ref := range prev.Gateways {
 		out[ref.Target] = ref
@@ -352,8 +378,10 @@ func (r *Reconciler) trackedGateways(ctx context.Context, serviceID string, prev
 		}
 		// Adopted without a tracked key: it was minted by a prior daemon and
 		// is ephemeral, so it lapses on its own if this gateway is later
-		// removed. KeyID stays empty; removeGateway tolerates that.
-		out[addr] = GatewayRef{Target: addr, ServiceID: gw.ID}
+		// removed. KeyID stays empty; removeGateway tolerates that. Its Hash
+		// is reconstructed from the running spec so the reconcile detects an
+		// image/tag/network drift (e.g. after a daemon upgrade) and updates it.
+		out[addr] = GatewayRef{Target: addr, ServiceID: gw.ID, Hash: liveGatewayHash(eg, gw)}
 	}
 	return out, nil
 }
@@ -382,7 +410,61 @@ func (r *Reconciler) createGateway(ctx context.Context, serviceID string, eg *Eg
 		r.expireOrLog(ctx, key.ID, "rollback after gateway create failure")
 		return GatewayRef{}, fmt.Errorf("create gateway for %s target %s: %w", serviceID, t.addr(), err)
 	}
-	return GatewayRef{Target: t.addr(), ServiceID: id, KeyID: key.ID}, nil
+	return GatewayRef{
+		Target:    t.addr(),
+		ServiceID: id,
+		KeyID:     key.ID,
+		Hash:      targetGatewayHash(eg, t, r.GatewayImage),
+	}, nil
+}
+
+// updateGateway updates a drifted surviving gateway in place (rolling
+// update, same service ID) to apply a new spec — e.g. a new image after a
+// daemon upgrade. The update restarts the task, and because gateways keep no
+// persistent tsnet state (no state volume mounted), the restarted container
+// comes up NeedsLogin and must register again — so a fresh ephemeral key is
+// minted and the old one rotated out. Swarm rejects stale writes, so it
+// inspects for the current version first. A vanished gateway returns
+// found=false so the caller recreates instead.
+func (r *Reconciler) updateGateway(ctx context.Context, serviceID string, eg *EgressSpec, t EgressTarget, ref GatewayRef) (newRef GatewayRef, found bool, err error) {
+	gw, err := r.Docker.InspectService(ctx, ref.ServiceID)
+	if errors.Is(err, ErrServiceNotFound) {
+		return GatewayRef{}, false, nil
+	}
+	if err != nil {
+		return ref, true, fmt.Errorf("inspect gateway %s: %w", ref.ServiceID, err)
+	}
+
+	if err := r.Limiter.Wait(ctx); err != nil {
+		return ref, true, fmt.Errorf("rate limit: %w", err)
+	}
+	key, err := r.Ctrl.CreateEphemeralKey(ctx, KeyRequest{
+		User:       r.Cfg.Headscale.User,
+		Tags:       []string{eg.Tag},
+		Ephemeral:  true,
+		Reusable:   false,
+		Expiration: r.Cfg.Headscale.KeyExpiration,
+	})
+	if err != nil {
+		return ref, true, fmt.Errorf("mint egress key for %s: %w", t.addr(), err)
+	}
+
+	spec := gatewaySpec(eg, t, serviceID, r.Cfg, r.GatewayImage, key.Secret)
+	if err := r.Docker.UpdateService(ctx, ref.ServiceID, gw.Version.Index, spec); err != nil {
+		r.expireOrLog(ctx, key.ID, "rollback after gateway update failure")
+		return ref, true, fmt.Errorf("update gateway %s: %w", ref.ServiceID, err)
+	}
+
+	// Update succeeded — rotate out the old key (best effort).
+	if ref.KeyID != "" && ref.KeyID != key.ID {
+		r.expireOrLog(ctx, ref.KeyID, "rotated egress key on gateway update")
+	}
+	return GatewayRef{
+		Target:    t.addr(),
+		ServiceID: ref.ServiceID,
+		KeyID:     key.ID,
+		Hash:      targetGatewayHash(eg, t, r.GatewayImage),
+	}, true, nil
 }
 
 // removeGateway deletes one gateway service and expires its key (best

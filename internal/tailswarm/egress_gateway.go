@@ -137,11 +137,12 @@ func encodeTargets(targets []EgressTarget) string {
 	return strings.Join(parts, ",")
 }
 
-// gatewayHash is the stable hash over the diff-relevant subset of a
-// gateway's desired spec — its identity, target set, overlay, and image.
-// The auth key is excluded (it rotates every reconcile). It mirrors
-// proxyHash: a matching hash means the live gateway already matches
-// desired and no Docker write is needed.
+// gatewayHash is the stable hash over the diff-relevant subset of an app's
+// whole egress spec — its identity, target set, overlay, and image. The auth
+// key is excluded (it rotates every reconcile). It is the coarse fast-path
+// gate: a matching whole-set hash with every target tracked means no Docker
+// write is needed. Per-target drift (e.g. a surviving gateway on a stale
+// image after a daemon upgrade) is detected by targetGatewayHash.
 func gatewayHash(eg *EgressSpec, image string) string {
 	targets := make([]string, len(eg.Targets))
 	for i, t := range eg.Targets {
@@ -161,6 +162,72 @@ func gatewayHash(eg *EgressSpec, image string) string {
 		Network:  eg.Network,
 		Targets:  targets,
 		Image:    image,
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		panic(err)
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// targetGatewayHash is the per-gateway drift hash: the diff-relevant subset
+// of one target's gateway spec (its per-target hostname, tag, network,
+// target addr, and image). A surviving gateway whose stored or live hash
+// differs from this is updated in place. The auth key is excluded.
+func targetGatewayHash(eg *EgressSpec, t EgressTarget, image string) string {
+	payload := struct {
+		Hostname string
+		Tag      string
+		Network  string
+		Target   string
+		Image    string
+	}{
+		Hostname: gatewayHostname(eg, t),
+		Tag:      eg.Tag,
+		Network:  eg.Network,
+		Target:   t.addr(),
+		Image:    image,
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		panic(err)
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// liveGatewayHash reconstructs targetGatewayHash from a running gateway's
+// spec, so an adopted gateway (store dropped on daemon restart/upgrade) can
+// be compared against desired and recreated/updated if it drifted. It reads
+// the same fields targetGatewayHash hashes back out of the service spec.
+func liveGatewayHash(eg *EgressSpec, gw swarm.Service) string {
+	cs := gw.Spec.TaskTemplate.ContainerSpec
+	if cs == nil {
+		return ""
+	}
+	env := map[string]string{}
+	for _, e := range cs.Env {
+		if k, v, ok := strings.Cut(e, "="); ok {
+			env[k] = v
+		}
+	}
+	var network string
+	if nets := gw.Spec.TaskTemplate.Networks; len(nets) > 0 {
+		network = nets[0].Target
+	}
+	payload := struct {
+		Hostname string
+		Tag      string
+		Network  string
+		Target   string
+		Image    string
+	}{
+		Hostname: env[envGatewayHostname],
+		Tag:      env[envGatewayTag],
+		Network:  network,
+		Target:   env[envGatewayTargets],
+		Image:    cs.Image,
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {

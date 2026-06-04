@@ -172,6 +172,85 @@ func TestReconcileGatewayNoOpOnUnchanged(t *testing.T) {
 	}
 }
 
+// When the daemon's gateway image changes (an upgrade, e.g. rc.8 -> rc.9),
+// a surviving gateway is updated in place to the new image and its key is
+// rotated (the restart re-registers, since gateways keep no persistent tsnet
+// state). This is the regression guard for gateways stuck on the old image.
+func TestReconcileGatewayUpdatesOnImageDrift(t *testing.T) {
+	r, d, c := testEgressReconciler(t)
+	id := d.addService(egressService("admin_phpmyadmin", "db-mysql:3306"))
+
+	if err := r.Reconcile(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := r.Store.Get(id)
+	gwID := before.Gateways[0].ServiceID
+	oldKey := before.Gateways[0].KeyID
+
+	// Daemon upgraded: a new gateway image is discovered.
+	r.GatewayImage = "ghcr.io/getlydian/tailswarm:rc.9"
+
+	if err := r.Reconcile(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(d.created) != 1 {
+		t.Errorf("gateway recreated instead of updated: created=%d", len(d.created))
+	}
+	if len(d.updated) != 1 || d.updated[0] != gwID {
+		t.Fatalf("gateway not updated in place: updated=%+v want [%s]", d.updated, gwID)
+	}
+	// The updated service carries the new image.
+	if got := d.services[gwID].Spec.TaskTemplate.ContainerSpec.Image; got != "ghcr.io/getlydian/tailswarm:rc.9" {
+		t.Errorf("gateway image after update = %q, want rc.9", got)
+	}
+	// Old key rotated out; a fresh key minted for the restart.
+	if len(c.expired) != 1 || c.expired[0] != oldKey {
+		t.Errorf("old key not rotated: expired=%+v want [%s]", c.expired, oldKey)
+	}
+	e, _ := r.Store.Get(id)
+	if e.Gateways[0].ServiceID != gwID {
+		t.Errorf("service ID changed on in-place update: %q", e.Gateways[0].ServiceID)
+	}
+}
+
+// After a daemon upgrade the store is empty but the old-image gateway still
+// runs; the reconciler adopts it by marker label, sees the image drift via
+// the reconstructed live hash, and updates it in place — without recreating.
+func TestReconcileAdoptedGatewayUpdatedOnImageDrift(t *testing.T) {
+	r, d, c := testEgressReconciler(t)
+	id := d.addService(egressService("admin_phpmyadmin", "db-mysql:3306"))
+
+	if err := r.Reconcile(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := r.Store.Get(id)
+	gwID := before.Gateways[0].ServiceID
+
+	// Simulate an upgrade: drop in-memory state, bump the discovered image.
+	r.Store.Delete(id)
+	r.GatewayImage = "ghcr.io/getlydian/tailswarm:rc.9"
+
+	if err := r.Reconcile(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(d.created) != 1 {
+		t.Errorf("adopted gateway recreated instead of updated: created=%d", len(d.created))
+	}
+	if len(d.updated) != 1 || d.updated[0] != gwID {
+		t.Fatalf("adopted gateway not updated in place: updated=%+v want [%s]", d.updated, gwID)
+	}
+	if got := d.services[gwID].Spec.TaskTemplate.ContainerSpec.Image; got != "ghcr.io/getlydian/tailswarm:rc.9" {
+		t.Errorf("adopted gateway image after update = %q, want rc.9", got)
+	}
+	// A fresh key was minted for the restart (the adopted gateway had no
+	// tracked key to rotate).
+	if len(c.created) != 2 {
+		t.Errorf("keys minted: got %d want 2 (initial + update)", len(c.created))
+	}
+}
+
 // Adding a target creates a new gateway and leaves the surviving gateway
 // (and its key) untouched — no churn on unrelated targets.
 func TestReconcileGatewayAddsTargetLeavesSurvivors(t *testing.T) {
@@ -417,6 +496,54 @@ func TestReconcileGatewayAdoptedAfterRestart(t *testing.T) {
 		if !wantSvcs[g.ServiceID] {
 			t.Errorf("adopted gateway id %q not among originals %v", g.ServiceID, wantSvcs)
 		}
+	}
+}
+
+// Migration: a legacy single gateway fronting multiple targets (the
+// pre-per-target format, all targets in one TAILSWARM_GATEWAY_TARGETS) is
+// adopted by marker label, found to match no single desired target, removed,
+// and replaced by one gateway per target.
+func TestReconcileLegacyMultiTargetGatewayMigrated(t *testing.T) {
+	r, d, _ := testEgressReconciler(t)
+	id := d.addService(egressService("admin_phpmyadmin", "db-a:3306, db-b:3306"))
+
+	// Inject a legacy gateway: one service, both targets, marker label set.
+	legacy := swarm.ServiceSpec{
+		Annotations: swarm.Annotations{
+			Name:   "tsgw-admin-phpmyadmin-egress",
+			Labels: map[string]string{gatewayForLabel: id},
+		},
+		TaskTemplate: swarm.TaskSpec{
+			ContainerSpec: &swarm.ContainerSpec{
+				Image: testGatewayImage,
+				Env:   []string{envGatewayTargets + "=db-a:3306,db-b:3306"},
+			},
+			Networks: []swarm.NetworkAttachmentConfig{
+				{Target: defaultOverlay, Aliases: []string{"db-a", "db-b"}},
+			},
+		},
+	}
+	legacyID, err := d.CreateService(context.Background(), legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Reset the create log so the assertion counts only reconcile-created
+	// gateways, not this fixture.
+	d.created = nil
+
+	if err := r.Reconcile(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(d.removed) != 1 || d.removed[0] != legacyID {
+		t.Errorf("legacy gateway not removed: removed=%+v want [%s]", d.removed, legacyID)
+	}
+	if len(d.created) != 2 {
+		t.Errorf("per-target gateways created: got %d want 2", len(d.created))
+	}
+	e, _ := r.Store.Get(id)
+	if want := []string{"db-a", "db-b"}; !equalStrings(gatewayAliases(d, e), want) {
+		t.Errorf("aliases after migration = %v, want %v", gatewayAliases(d, e), want)
 	}
 }
 

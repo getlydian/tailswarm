@@ -266,7 +266,9 @@ daemon and manages the gateway's Docker lifecycle.
   target) through a create/remove lifecycle keyed on each target's
   `host:port` addr — desired-vs-tracked diff per pass: added targets mint a
   key + create a gateway; removed targets are deleted and their key expired;
-  surviving targets are left running untouched (no key churn on unrelated
+  surviving targets are left running untouched *unless* their per-target hash
+  drifted (e.g. a new image after a daemon upgrade), in which case the gateway
+  is updated in place with a freshly minted key (no churn on unrelated
   targets). The Store entry holds `Gateways []GatewayRef` plus a single
   `GatewayHash` over the whole desired target set (fast no-op path). After a
   daemon restart the still-running gateways are re-adopted by marker label
@@ -344,6 +346,21 @@ introduces `tag:svc-*` as a **source**.
       []GatewayRef`; the reconciler diffs the target set per pass, leaving
       surviving gateways untouched. Surfaced by the Thanos query crash (five
       `:10901` targets → `bind: address already in use`). (2026-06-04)
+- [x] Surviving-gateway drift (image/tag/network): **per-gateway hash +
+      in-place `UpdateService`**. Each `GatewayRef` carries a per-target hash
+      (`targetGatewayHash`); a surviving gateway whose hash drifts from
+      desired is updated in place (same service ID) rather than left stale.
+      Adopted gateways (store dropped on a daemon restart/upgrade) get their
+      hash reconstructed from the running spec (`liveGatewayHash`) so drift is
+      detected even with an empty store. Surfaced by gateways staying on the
+      old image after a daemon upgrade (rc.8 while the daemon ran rc.9): the
+      original whole-set-only update path was lost in the per-target refactor.
+      (2026-06-04)
+- [x] Key handling on gateway update: **mint fresh + rotate old**. Gateways
+      mount no state volume, so any restart (including a rolling
+      `UpdateService`) comes up `NeedsLogin` and must re-register. Ephemeral
+      keys are single-use, so an update mints a new key and expires the old
+      one — it cannot reuse the prior key. (2026-06-04)
 - [x] Local ports: **none** — the alias model dials the real name, so the
       `@local-port` / auto-assign question is moot. (2026-06-04)
 - [x] Gateway image: **tailswarm's own image** in a `gateway` subcommand,
