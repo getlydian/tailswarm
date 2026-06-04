@@ -74,8 +74,13 @@ func gatewaySpec(eg *EgressSpec, appServiceID string, cfg Config, image, authKey
 		},
 		TaskTemplate: swarm.TaskSpec{
 			ContainerSpec: &swarm.ContainerSpec{
-				Image:   image,
-				Command: []string{"tailswarm"},
+				Image: image,
+				// Absolute path — must match the image's ENTRYPOINT
+				// (/tailswarm). ContainerSpec.Command is the exec form
+				// (argv[0]); the distroless image has no shell and no
+				// $PATH lookup, so a bare "tailswarm" fails with
+				// "executable file not found in $PATH".
+				Command: []string{"/tailswarm"},
 				Args:    []string{"gateway"},
 				Env:     env,
 			},

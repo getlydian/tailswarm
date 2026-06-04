@@ -129,17 +129,21 @@ func run(ctx context.Context, args []string, env func(string) string, _, stderr 
 	// Egress gateways run tailswarm's own image in "gateway" mode, so
 	// discover it from the daemon's own Swarm service rather than asking
 	// the operator to configure (and keep in sync) an image reference.
-	// Failure is non-fatal: a pure-ingress deployment never needs it, and
-	// an egressing service surfaces the misconfiguration as a reconcile
-	// error if the image stayed empty.
-	if hostname, herr := os.Hostname(); herr != nil {
-		logger.Warn("hostname lookup failed; egress gateway image undiscovered", "err", herr)
-	} else if img, derr := tailswarm.DiscoverGatewayImage(ctx, dockerClient, hostname); derr != nil {
-		logger.Warn("egress gateway image undiscovered; egress will be unavailable", "err", derr)
-	} else {
-		reconciler.GatewayImage = img
-		logger.Info("discovered egress gateway image", "image", img)
+	// Discovery failure is fatal: it almost always means a real
+	// misconfiguration (the daemon isn't running as a Swarm service, or
+	// the socket proxy is missing the SWARM/NODES/TASKS read scopes), and
+	// failing loud at startup beats silently disabling egress and leaving
+	// an egressing service to fail reconcile-by-reconcile forever.
+	hostname, err := os.Hostname()
+	if err != nil {
+		return fmt.Errorf("hostname lookup for egress gateway image discovery: %w", err)
 	}
+	img, err := tailswarm.DiscoverGatewayImage(ctx, dockerClient, hostname)
+	if err != nil {
+		return fmt.Errorf("discover egress gateway image: %w", err)
+	}
+	reconciler.GatewayImage = img
+	logger.Info("discovered egress gateway image", "image", img)
 
 	queue := tailswarm.NewQueue(defaultWorkerCount, defaultQueueBuffer)
 	events := make(chan string, defaultEventChanDepth)
