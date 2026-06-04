@@ -27,8 +27,16 @@
 #
 # tailswarm never touches the raw Docker socket. It talks to a
 # tecnativa/docker-socket-proxy sidecar constrained to a manager node,
-# and only the read-side API sections are enabled — the tsnet design
-# never creates, updates, or removes Docker services.
+# with only the API sections it uses enabled.
+#
+# Ingress alone needs no write access. Egress (the egress-app.yml
+# example) does: tailswarm creates/updates/removes one companion gateway
+# service per egressing app, so POST is enabled and scoped to SERVICES.
+# If you do not use egress, set POST: 0 to keep the surface read-only.
+#
+# The gateway runs the same image as this daemon, in `gateway` mode.
+# tailswarm discovers it at startup from its own Swarm service (via the
+# TASKS + SERVICES API sections below) — there is no image to configure.
 
 version: "3.8"
 
@@ -44,8 +52,10 @@ services:
       NETWORKS: 1
       TASKS: 1
       EVENTS: 1
-      # No POST — tailswarm has no write paths in the tsnet design.
-      POST: 0
+      # POST is required only for egress (gateway create/update/remove),
+      # and is scoped to the SERVICES section. Set POST: 0 for a
+      # pure-ingress deployment.
+      POST: 1
       CONTAINERS: 0
       EXEC: 0
       IMAGES: 0

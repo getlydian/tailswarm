@@ -23,6 +23,13 @@ deploy time, so it can resolve every managed service's Swarm DNS name
 `EndpointSpec`. Services remain isolated from each other at the overlay
 level — they only see each other over the tailnet.
 
+That is the **inbound** path: a service is *reached* from the tailnet.
+tailswarm also supports **egress** — a service that *dials out* to
+another tailnet member by its real MagicDNS name. For each egressing
+service tailswarm deploys a companion gateway (its own image in `gateway`
+mode) that listens on the overlay and forwards out the tailnet. See
+[Egress (outbound) labels](#egress-outbound-labels).
+
 ## Quickstart
 
 ```sh
@@ -111,6 +118,39 @@ Ports are sourced automatically from the service's `EndpointSpec.Ports`
 (TCP only). If `label_namespace` is changed, replace the `tailswarm.`
 prefix accordingly (e.g. `tailswarm-stage.enable`).
 
+### Egress (outbound) labels
+
+The labels above make a service *reachable* from the tailnet (inbound).
+Egress is the mirror image: it lets a service *dial out* to another
+tailnet member by its real MagicDNS name. A service may use ingress
+labels, egress labels, or both — they are independent.
+
+| Label                       | Required | Default                       | Description                                                                                                                  |
+| --------------------------- | -------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `tailswarm.egress.enable`   | yes      | —                             | Must be `"true"` to opt the service into outbound proxying.                                                                  |
+| `tailswarm.egress.targets`  | yes      | —                             | Comma-separated `host:port` list of MagicDNS targets to reach. No local-port suffix — the app dials the real remote name.    |
+| `tailswarm.egress.tag`      | no       | `tag:swarm-<service>`         | Tailnet identity outbound connections originate as (the ACL *source*). Must match one of the daemon's `allowed_tags` patterns. |
+| `tailswarm.egress.hostname` | no       | `<stack>-<service>-egress`    | Tailnet hostname of the gateway node.                                                                                        |
+| `tailswarm.egress.network`  | no       | shared overlay                | Override the overlay the gateway joins.                                                                                      |
+
+The operator writes **only** these labels on the app. For each egressing
+service tailswarm derives and manages a companion **gateway** service
+(`tsgw-<egress-hostname>`) running its own image in `gateway` mode: it
+joins the overlay carrying each target host as a network alias, so
+Docker's overlay DNS resolves the real remote name to the gateway, which
+forwards the connection out the tailnet under the app's `egress.tag`. The
+app's config names the real remote host and port — no synthesized ports,
+nothing to read back. Adding a target is a one-line edit to
+`tailswarm.egress.targets`.
+
+The gateway image needs no configuration: tailswarm runs the same image
+the daemon itself runs, discovered at startup from the daemon's own Swarm
+service. Egress requires `POST` enabled on the socket proxy (see
+[Security](#security)).
+
+See [`examples/egress-app.yml`](examples/egress-app.yml) for a worked
+example.
+
 ## Lifecycle
 
 | Event                                      | tailswarm action                                                          |
@@ -118,7 +158,10 @@ prefix accordingly (e.g. `tailswarm-stage.enable`).
 | Service created with `tailswarm.enable`    | Mint key → start tsnet server → open per-port listeners.                  |
 | Labels or ports change                     | Mint new key → start replacement tsnet server → close old one, expire old key. |
 | Service removed or disabled                | Close tsnet server → expire key. Headscale auto-removes the ephemeral node. |
-| tailswarm restarts                         | tsnet servers restart from persisted state in `tsnet.state_dir`; no new Headscale key needed if node identity is intact. |
+| Service created with `tailswarm.egress.enable` | Mint key → create the gateway service (its own image, `gateway` mode) with the target hosts as overlay aliases under `egress.tag`. |
+| Egress targets or tag change               | Mint new key → update the gateway in place → expire the old key. A matching desired-spec hash is a no-op. |
+| Egress disabled or service removed         | Remove the gateway service → expire its key. |
+| tailswarm restarts                         | tsnet servers restart from persisted state in `tsnet.state_dir`; no new Headscale key needed if node identity is intact. Egress gateways outlive the daemon and are re-adopted by their marker label rather than recreated. |
 
 ## Security
 
@@ -126,17 +169,26 @@ tailswarm needs Docker API access from a manager node. The recommended
 deployment puts a
 [`tecnativa/docker-socket-proxy`](https://github.com/Tecnativa/docker-socket-proxy)
 in front of it with only the API sections tailswarm uses enabled
-(`SERVICES`, `NETWORKS`, `TASKS`, `EVENTS`); the tsnet design no longer
-needs `POST`, since the daemon never creates, updates, or removes any
-Docker service. tailswarm connects via `DOCKER_HOST=tcp://docker-proxy:2375`
+(`SERVICES`, `NETWORKS`, `TASKS`, `EVENTS`). Ingress is read-only: it
+never creates, updates, or removes a Docker service, so a pure-ingress
+deployment runs with `POST: 0`. Egress reintroduces write access —
+gateway create/update/remove — so it requires `POST`, scoped to the
+`SERVICES` section. tailswarm still needs no `CONTAINERS`, `EXEC`,
+`SECRETS`, etc. It connects via `DOCKER_HOST=tcp://docker-proxy:2375`
 over an internal overlay.
 
-tsnet runs in userspace — the tailswarm container needs no `NET_ADMIN`,
-no `/dev/net/tun`, and no privileged flags. Pre-auth keys are minted
-with a short expiry (default 5 minutes — long enough for tsnet to
-register, no longer) and are never logged. ACL tags are namespaced as
-`tag:swarm-<service>` by default; the `tailswarm.tag` label can only
-narrow within `allowed_tags`.
+tsnet runs in userspace — the tailswarm container *and* every egress
+gateway need no `NET_ADMIN`, no `/dev/net/tun`, and no privileged flags.
+Pre-auth keys are minted with a short expiry (default 5 minutes — long
+enough for tsnet to register, no longer) and are never logged. ACL tags
+are namespaced as `tag:swarm-<service>` by default; the `tailswarm.tag`
+and `tailswarm.egress.tag` labels can only narrow within `allowed_tags`.
+
+Egress makes a `tag:svc-*` a tailnet *source*, not just a destination: a
+gateway can dial any MagicDNS name its ACL permits, so the Headscale ACL
+is the sole containment boundary for outbound traffic. Per-app gateways
+keep the tailnet source identity equal to the app's own `egress.tag`
+rather than collapsing all egress to one shared tag.
 
 ## Failure modes
 

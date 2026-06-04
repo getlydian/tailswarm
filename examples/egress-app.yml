@@ -1,0 +1,78 @@
+# A service that dials OUT to another tailnet member (egress mode).
+#
+#   docker stack deploy -c egress-app.yml reporting
+#
+# Where the inbound example (sample-app.yml) makes a local service
+# *reachable* from the tailnet, this one lets a local service *originate*
+# connections to a remote tailnet member by its real MagicDNS name.
+#
+# The scenario: two independent swarms share one tailnet.
+#
+#   * Swarm A runs a database and exposes it inbound under the MagicDNS
+#     name "db-primary" (the sample-app.yml pattern, with port 5432).
+#   * Swarm B (this stack) runs a "reporting" worker that needs to query
+#     that database. It does not run on Swarm A and has no overlay route
+#     to it — only the tailnet connects them.
+#
+# The operator writes ONLY the tailswarm.egress.* labels below. tailswarm
+# sees them and creates a companion gateway service (tsgw-reporting-worker-egress,
+# tailswarm's own image in `gateway` mode) attached to the shared overlay,
+# holding "db-primary" as a network alias. Docker's overlay DNS then
+# resolves "db-primary" to the gateway, which forwards each connection out
+# the tailnet via the gateway's tsnet identity (tag:svc-reporting).
+#
+# The runtime path:
+#
+#   worker ─connect db-primary:5432─► overlay DNS → tsgw-reporting-worker-egress
+#                                     └─ srv.Dial("db-primary:5432") over tailnet
+#                                     └─ Swarm A's ingress proxy → its database
+#
+# The worker's config names the REAL remote host and port — there are no
+# synthesized local ports and nothing to read back. Adding another target
+# is a one-line edit to tailswarm.egress.targets.
+
+version: "3.8"
+
+services:
+  worker:
+    image: alpine:3
+    networks:
+      - tailswarm-overlay
+    # The app dials the real remote name. With the gateway in place,
+    # "db-primary" resolves on the overlay to the gateway, which forwards
+    # the connection out the tailnet. Replace this command with your real
+    # workload; the relevant part is that it connects to db-primary:5432.
+    command: >
+      sh -c "while true; do
+        nc -z -w3 db-primary 5432 && echo 'db-primary:5432 reachable' || echo 'db-primary:5432 unreachable';
+        sleep 30;
+      done"
+    deploy:
+      replicas: 1
+      labels:
+        # Required: opt the service into egress.
+        tailswarm.egress.enable: "true"
+
+        # The comma-separated host:port list of REAL remote MagicDNS
+        # targets this service dials. No local-port suffix — the app uses
+        # the real name and port. Add more by extending this list, e.g.
+        # "db-primary:5432, analytics-db:5432".
+        tailswarm.egress.targets: "db-primary:5432"
+
+        # Optional: the tailnet identity outbound connections originate as
+        # (the ACL *source* tag). Must match one of the daemon's
+        # allowed_tags patterns, exactly like the ingress tailswarm.tag.
+        # Defaults to the derived tag tag:swarm-worker.
+        tailswarm.egress.tag: "tag:svc-reporting"
+
+        # Optional: tailnet hostname for the gateway node. Defaults to
+        # <stack>-<service>-egress (here "reporting-worker-egress").
+        # tailswarm.egress.hostname: "reporting-worker-egress"
+
+        # Optional: overlay the gateway joins. Defaults to the shared
+        # tailswarm-overlay; override only if this service can't use it.
+        # tailswarm.egress.network: "tailswarm-overlay"
+
+networks:
+  tailswarm-overlay:
+    external: true

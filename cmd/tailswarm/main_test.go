@@ -52,6 +52,22 @@ func (f *fakeRunDocker) ListNetworks(_ context.Context) ([]swarm.Network, error)
 	return nil, nil
 }
 
+func (f *fakeRunDocker) ListTasks(_ context.Context) ([]swarm.Task, error) {
+	return nil, nil
+}
+
+func (f *fakeRunDocker) CreateService(_ context.Context, _ swarm.ServiceSpec) (string, error) {
+	return "", nil
+}
+
+func (f *fakeRunDocker) UpdateService(_ context.Context, _ string, _ uint64, _ swarm.ServiceSpec) error {
+	return nil
+}
+
+func (f *fakeRunDocker) RemoveService(_ context.Context, _ string) error {
+	return nil
+}
+
 type silentEvents struct{}
 
 func (silentEvents) Subscribe(ctx context.Context) (<-chan tailswarm.Event, error) {

@@ -9,13 +9,26 @@ import (
 // ticks: the live tsnet proxy, the spec hash that produced it, and the
 // preauth key ID so we can expire it on rotation or teardown.
 //
-// Unlike the sidecar design there is no Docker-side artefact to track
-// — the proxy *is* the artefact, and lives entirely in this process.
+// For ingress there is no Docker-side artefact to track — the proxy *is*
+// the artefact, and lives entirely in this process. Egress is different:
+// the gateway is a managed Docker service, so its fields (below) record
+// the external artefact we must update and tear down.
 type Entry struct {
 	Proxy           *Proxy
 	LastSpecHash    string
 	PreAuthKeyID    string
 	LastReconcileAt time.Time
+
+	// Egress gateway bookkeeping. Unlike the ingress Proxy (which lives in
+	// this process), the gateway is a managed Docker service: GatewayServiceID
+	// is its Swarm service ID (so we can update or remove it), GatewayHash is
+	// the spec hash that produced it (so we can detect drift), and
+	// GatewayKeyID is the preauth key minted under the app's egress.tag (so we
+	// can expire it on rotation or teardown). All three are zero for a
+	// pure-ingress service.
+	GatewayServiceID string
+	GatewayHash      string
+	GatewayKeyID     string
 }
 
 // Store is a concurrency-safe map keyed by Swarm service ID. It owns

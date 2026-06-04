@@ -29,13 +29,19 @@ type LabelFilter struct {
 	Value string
 }
 
-// DockerClient is the read-only Docker API surface tailswarm uses in
-// the tsnet design. Service mutation is gone — there are no sidecars to
-// create, update, or remove.
+// DockerClient is the Docker API surface tailswarm uses. The read paths
+// (List/Inspect/ListNetworks) drive both ingress and egress reconcile;
+// the write paths (Create/Update/Remove) are used only to manage egress
+// gateway companion services. Ingress touches no write path.
 type DockerClient interface {
 	ListServices(ctx context.Context, filter LabelFilter) ([]swarm.Service, error)
 	InspectService(ctx context.Context, serviceID string) (swarm.Service, error)
 	ListNetworks(ctx context.Context) ([]swarm.Network, error)
+	ListTasks(ctx context.Context) ([]swarm.Task, error)
+
+	CreateService(ctx context.Context, spec swarm.ServiceSpec) (string, error)
+	UpdateService(ctx context.Context, serviceID string, version uint64, spec swarm.ServiceSpec) error
+	RemoveService(ctx context.Context, serviceID string) error
 }
 
 // Reconciler converges Docker Swarm services into a set of in-process
@@ -49,6 +55,13 @@ type Reconciler struct {
 	Cfg     Config
 	Limiter *rate.Limiter
 	Log     *slog.Logger
+
+	// GatewayImage is the image egress gateway companions run — tailswarm's
+	// own image in "gateway" mode. The wiring in cmd/tailswarm discovers it
+	// from the daemon's own Swarm service (see DiscoverGatewayImage) and
+	// sets it here. Empty means egress is unavailable: an egressing service
+	// reconciles to errGatewayImageUnset.
+	GatewayImage string
 
 	// NewProxy is the factory used to start a tsnet proxy. Tests inject
 	// a fake; production wires NewTsnetProxy.
@@ -80,14 +93,14 @@ func NewReconciler(d DockerClient, c Controller, s *Store, cfg Config) *Reconcil
 	return r
 }
 
-// Reconcile drives one service ID through the proxy lifecycle:
+// Reconcile drives one service ID through the ingress proxy and egress
+// gateway lifecycles:
 //
-//  1. Inspect target. Gone or disabled → close the proxy and expire its key.
-//  2. Parse labels + ports. Malformed → tear down.
-//  3. Hash the desired ProxyConfig; compare to last applied. No-op on match.
-//  4. Mint a fresh ephemeral key (rate-limited).
-//  5. Start a new tsnet proxy. On success, close the previous one and
-//     expire its key.
+//  1. Inspect target. Gone or disabled → tear down both and expire keys.
+//  2. Parse labels. Malformed → tear down.
+//  3. Run the ingress reconcile (no-op when the service doesn't ingress)
+//     and the egress reconcile (no-op when it doesn't egress). Each is
+//     independent; a service may use either, both, or neither.
 func (r *Reconciler) Reconcile(ctx context.Context, serviceID string) error {
 	target, err := r.Docker.InspectService(ctx, serviceID)
 	if errors.Is(err, ErrServiceNotFound) {
@@ -95,6 +108,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, serviceID string) error {
 	}
 	if err != nil {
 		return fmt.Errorf("inspect service %s: %w", serviceID, err)
+	}
+
+	// Egress gateways are tailswarm's own creations, not opted-in apps.
+	// Skip them outright so a stray event on a gateway never drives the
+	// app-reconcile path.
+	if _, isGateway := target.Spec.Labels[gatewayForLabel]; isGateway {
+		return nil
 	}
 
 	networks, err := r.Docker.ListNetworks(ctx)
@@ -118,6 +138,24 @@ func (r *Reconciler) Reconcile(ctx context.Context, serviceID string) error {
 	}
 	if !enabled {
 		return r.teardown(ctx, serviceID)
+	}
+
+	// Ingress and egress are independent. Run both; each tears down its own
+	// stale artefact if the service no longer opts into that direction
+	// (e.g. egress labels removed from a service that keeps ingress). The
+	// errors are joined so one direction's failure doesn't silently mask
+	// the other's progress.
+	ingErr := r.reconcileIngress(ctx, serviceID, tgt)
+	egrErr := r.reconcileEgress(ctx, serviceID, tgt)
+	return errors.Join(ingErr, egrErr)
+}
+
+// reconcileIngress drives the in-process tsnet proxy lifecycle for a
+// service. When the service does not opt into ingress it tears down any
+// stale proxy (without touching the egress gateway) and returns.
+func (r *Reconciler) reconcileIngress(ctx context.Context, serviceID string, tgt Target) error {
+	if !tgt.Ingress {
+		return r.teardownIngress(ctx, serviceID)
 	}
 
 	desired := proxyConfigFor(tgt, r.Cfg)
@@ -154,13 +192,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, serviceID string) error {
 	}
 
 	// Swap in the new proxy. Close the old one (if any) and expire its
-	// previous key after the new one is healthy.
-	r.Store.Put(serviceID, Entry{
-		Proxy:           proxy,
-		LastSpecHash:    desiredHash,
-		PreAuthKeyID:    key.ID,
-		LastReconcileAt: time.Now(),
-	})
+	// previous key after the new one is healthy. Carry forward the egress
+	// gateway fields untouched — reconcileEgress owns those.
+	next := prev
+	next.Proxy = proxy
+	next.LastSpecHash = desiredHash
+	next.PreAuthKeyID = key.ID
+	next.LastReconcileAt = time.Now()
+	r.Store.Put(serviceID, next)
 	if hadPrev && prev.Proxy != nil {
 		if err := prev.Proxy.Close(); err != nil {
 			r.Log.Warn("close previous proxy", "service_id", serviceID, "err", err)
@@ -176,11 +215,142 @@ func (r *Reconciler) Reconcile(ctx context.Context, serviceID string) error {
 	return nil
 }
 
-// teardown closes any proxy we know about for serviceID and expires its
-// preauth key. Each step is best-effort.
+// reconcileEgress drives the egress gateway lifecycle for a service:
+//
+//  1. Not egressing → tear down any stale gateway (without touching the
+//     ingress proxy) and return.
+//  2. Hash the desired gateway spec; matching the live one → no-op.
+//  3. Mint a fresh ephemeral key under the app's egress.tag (rate-limited).
+//  4. Create the gateway (first time) or update it in place (label change),
+//     then expire the previous key.
+//
+// The gateway is a managed Docker service, so unlike ingress this writes to
+// the Docker socket (Create/Update/Remove) — the only place tailswarm does.
+func (r *Reconciler) reconcileEgress(ctx context.Context, serviceID string, tgt Target) error {
+	if tgt.Egress == nil {
+		return r.teardownEgress(ctx, serviceID)
+	}
+	if r.GatewayImage == "" {
+		return errGatewayImageUnset
+	}
+
+	eg := tgt.Egress
+	desiredHash := gatewayHash(eg, r.GatewayImage)
+
+	prev, hadPrev := r.Store.Get(serviceID)
+	if hadPrev && prev.GatewayHash == desiredHash && prev.GatewayServiceID != "" {
+		prev.LastReconcileAt = time.Now()
+		r.Store.Put(serviceID, prev)
+		return nil
+	}
+
+	if err := r.Limiter.Wait(ctx); err != nil {
+		return fmt.Errorf("rate limit: %w", err)
+	}
+	key, err := r.Ctrl.CreateEphemeralKey(ctx, KeyRequest{
+		User:       r.Cfg.Headscale.User,
+		Tags:       []string{eg.Tag},
+		Ephemeral:  true,
+		Reusable:   false,
+		Expiration: r.Cfg.Headscale.KeyExpiration,
+	})
+	if err != nil {
+		return fmt.Errorf("mint egress key: %w", err)
+	}
+
+	spec := gatewaySpec(eg, serviceID, r.Cfg, r.GatewayImage, key.Secret)
+
+	gatewayID := prev.GatewayServiceID
+	if gatewayID == "" {
+		// No gateway tracked in the store. After a daemon restart the
+		// gateway may still exist on the swarm (it outlives the daemon);
+		// adopt it by its marker label rather than creating a duplicate
+		// (Docker rejects a second service with the same name).
+		if adopted, err := r.findGateway(ctx, serviceID); err != nil {
+			r.expireOrLog(ctx, key.ID, "rollback after gateway lookup failure")
+			return fmt.Errorf("find gateway for %s: %w", serviceID, err)
+		} else if adopted != "" {
+			gatewayID = adopted
+		}
+	}
+	if gatewayID != "" {
+		// Update the existing gateway in place. Swarm rejects stale writes,
+		// so inspect for the current version first.
+		gw, err := r.Docker.InspectService(ctx, gatewayID)
+		if errors.Is(err, ErrServiceNotFound) {
+			// Gateway vanished out from under us — fall back to recreate.
+			gatewayID = ""
+		} else if err != nil {
+			r.expireOrLog(ctx, key.ID, "rollback after gateway inspect failure")
+			return fmt.Errorf("inspect gateway %s: %w", gatewayID, err)
+		} else if err := r.Docker.UpdateService(ctx, gatewayID, gw.Version.Index, spec); err != nil {
+			r.expireOrLog(ctx, key.ID, "rollback after gateway update failure")
+			return fmt.Errorf("update gateway %s: %w", gatewayID, err)
+		}
+	}
+	if gatewayID == "" {
+		id, err := r.Docker.CreateService(ctx, spec)
+		if err != nil {
+			r.expireOrLog(ctx, key.ID, "rollback after gateway create failure")
+			return fmt.Errorf("create gateway for %s: %w", serviceID, err)
+		}
+		gatewayID = id
+	}
+
+	// Swap in the new gateway state, carrying ingress fields untouched.
+	next := prev
+	next.GatewayServiceID = gatewayID
+	next.GatewayHash = desiredHash
+	next.GatewayKeyID = key.ID
+	next.LastReconcileAt = time.Now()
+	r.Store.Put(serviceID, next)
+
+	if hadPrev && prev.GatewayKeyID != "" && prev.GatewayKeyID != key.ID {
+		r.expireOrLog(ctx, prev.GatewayKeyID, "rotated egress key")
+	}
+	r.Log.Info("reconciled egress",
+		"service_id", serviceID,
+		"gateway_id", gatewayID,
+		"hostname", eg.Hostname,
+		"hash", desiredHash)
+	return nil
+}
+
+// findGateway returns the service ID of an existing gateway fronting
+// appServiceID, or "" if none exists. It matches on the gatewayForLabel
+// marker so a daemon restart adopts a still-running gateway instead of
+// creating a duplicate.
+func (r *Reconciler) findGateway(ctx context.Context, appServiceID string) (string, error) {
+	gws, err := r.Docker.ListServices(ctx, LabelFilter{Key: gatewayForLabel, Value: appServiceID})
+	if err != nil {
+		return "", err
+	}
+	for _, gw := range gws {
+		if gw.Spec.Labels[gatewayForLabel] == appServiceID {
+			return gw.ID, nil
+		}
+	}
+	return "", nil
+}
+
+// teardown removes every artefact we know about for serviceID — both the
+// ingress proxy and the egress gateway — expires their keys, and drops the
+// store entry. Used when the service is gone, disabled, or malformed. Each
+// step is best-effort; the first error is returned.
 func (r *Reconciler) teardown(ctx context.Context, serviceID string) error {
+	ingErr := r.teardownIngress(ctx, serviceID)
+	egrErr := r.teardownEgress(ctx, serviceID)
+	r.Store.Delete(serviceID)
+	return errors.Join(ingErr, egrErr)
+}
+
+// teardownIngress closes the in-process proxy for serviceID and expires
+// its preauth key, leaving any egress gateway untouched. It clears the
+// ingress fields from the store entry (and deletes the entry if no egress
+// artefact remains). Each step is best-effort.
+func (r *Reconciler) teardownIngress(ctx context.Context, serviceID string) error {
 	prev, ok := r.Store.Get(serviceID)
-	if !ok {
+	if !ok || (prev.Proxy == nil && prev.PreAuthKeyID == "") {
 		return nil
 	}
 
@@ -203,13 +373,69 @@ func (r *Reconciler) teardown(ctx context.Context, serviceID string) error {
 			}
 		}
 	}
-	r.Store.Delete(serviceID)
+
+	prev.Proxy = nil
+	prev.LastSpecHash = ""
+	prev.PreAuthKeyID = ""
+	if prev.GatewayServiceID == "" {
+		r.Store.Delete(serviceID)
+	} else {
+		r.Store.Put(serviceID, prev)
+	}
 	return firstErr
 }
 
-// CloseAll tears down every proxy on shutdown. Keys are not expired
-// here — they're already ephemeral and will lapse on their own once the
-// tsnet servers disconnect.
+// teardownEgress removes the egress gateway service for serviceID and
+// expires its preauth key, leaving any ingress proxy untouched. It clears
+// the gateway fields from the store entry (and deletes the entry if no
+// ingress artefact remains). Each step is best-effort.
+func (r *Reconciler) teardownEgress(ctx context.Context, serviceID string) error {
+	prev, ok := r.Store.Get(serviceID)
+	if !ok || (prev.GatewayServiceID == "" && prev.GatewayKeyID == "") {
+		return nil
+	}
+
+	var firstErr error
+	if prev.GatewayServiceID != "" {
+		if err := r.Limiter.Wait(ctx); err != nil {
+			return err
+		}
+		if err := r.Docker.RemoveService(ctx, prev.GatewayServiceID); err != nil {
+			r.Log.Warn("remove gateway", "service_id", serviceID,
+				"gateway_id", prev.GatewayServiceID, "err", err)
+			firstErr = err
+		}
+	}
+	if prev.GatewayKeyID != "" {
+		if err := r.Limiter.Wait(ctx); err != nil {
+			return err
+		}
+		if err := r.Ctrl.ExpireKey(ctx, prev.GatewayKeyID); err != nil {
+			r.Log.Warn("expire gateway key", "service_id", serviceID,
+				"key_id", prev.GatewayKeyID, "err", err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+
+	prev.GatewayServiceID = ""
+	prev.GatewayHash = ""
+	prev.GatewayKeyID = ""
+	if prev.Proxy == nil {
+		r.Store.Delete(serviceID)
+	} else {
+		r.Store.Put(serviceID, prev)
+	}
+	return firstErr
+}
+
+// CloseAll tears down every in-process proxy on shutdown. Keys are not
+// expired here — they're already ephemeral and will lapse on their own
+// once the tsnet servers disconnect. Egress gateways are deliberately
+// left running: they are independent Docker services that keep forwarding
+// across a daemon restart, and the next reconcile re-adopts them by their
+// marker label (see findGateway).
 func (r *Reconciler) CloseAll() {
 	for id, e := range r.Store.Snapshot() {
 		if e.Proxy != nil {

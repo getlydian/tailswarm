@@ -108,10 +108,11 @@ func startProxyOn(ctx context.Context, srv tsnetServer, cfg ProxyConfig, log *sl
 			return nil, fmt.Errorf("listen %d: %w", port.Target, err)
 		}
 		dst := fmt.Sprintf("%s:%d", cfg.Target, port.Target)
+		dial := overlayDialer(dst)
 		p.wg.Add(1)
 		go func() {
 			defer p.wg.Done()
-			acceptLoop(pctx, ln, dst, log)
+			acceptLoop(pctx, ln, dst, dial, log)
 		}()
 	}
 	return p, nil
@@ -131,10 +132,24 @@ func (p *Proxy) Close() error {
 // Useful for log fields and tests.
 func (p *Proxy) Hostname() string { return p.cfg.Hostname }
 
-// acceptLoop accepts incoming tailnet connections on ln and spawns a
-// forwarding goroutine for each. Exits when ctx is cancelled or the
-// listener is closed.
-func acceptLoop(ctx context.Context, ln net.Listener, target string, log *slog.Logger) {
+// dialFunc opens the upstream connection a forward should pump into.
+// Ingress backs it with a net.Dialer to the overlay target; egress backs
+// it with tsnet.Server.Dial to a MagicDNS target on the tailnet.
+type dialFunc func(ctx context.Context) (net.Conn, error)
+
+// overlayDialer returns a dialFunc that dials target over the host
+// network with a plain net.Dialer. This is the ingress upstream path.
+func overlayDialer(target string) dialFunc {
+	return func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", target)
+	}
+}
+
+// acceptLoop accepts incoming connections on ln and spawns a forwarding
+// goroutine for each. target is used only for log context; dial opens the
+// upstream. Exits when ctx is cancelled or the listener is closed.
+func acceptLoop(ctx context.Context, ln net.Listener, target string, dial dialFunc, log *slog.Logger) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -145,18 +160,17 @@ func acceptLoop(ctx context.Context, ln net.Listener, target string, log *slog.L
 			// down. Either way, exit.
 			return
 		}
-		go forwardTCP(ctx, conn, target, log)
+		go forwardTCP(ctx, conn, target, dial, log)
 	}
 }
 
-// forwardTCP dials target and pumps bytes between conn and the upstream
-// connection. Closes both ends on either context cancel or upstream
-// failure.
-func forwardTCP(ctx context.Context, conn net.Conn, target string, log *slog.Logger) {
+// forwardTCP opens the upstream via dial and pumps bytes between conn and
+// it. target labels the upstream in logs. Closes both ends on either
+// context cancel or upstream failure.
+func forwardTCP(ctx context.Context, conn net.Conn, target string, dial dialFunc, log *slog.Logger) {
 	defer func() { _ = conn.Close() }()
 
-	var d net.Dialer
-	upstream, err := d.DialContext(ctx, "tcp", target)
+	upstream, err := dial(ctx)
 	if err != nil {
 		log.Warn("dial upstream", "target", target, "err", err)
 		return

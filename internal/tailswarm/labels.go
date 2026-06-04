@@ -7,6 +7,7 @@ package tailswarm
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/docker/docker/api/types/swarm"
@@ -25,6 +26,13 @@ const defaultNamespace = "tailswarm"
 // tailswarm.network.
 const defaultOverlay = "tailswarm-overlay"
 
+// gatewayForLabel marks an egress gateway service tailswarm itself
+// created, recording the app service ID it fronts. It is intentionally
+// NOT namespaced under the configurable label prefix and never carries
+// "<namespace>.enable", so the watcher's full-list filter and the
+// reconciler skip it rather than treating it as an opted-in app.
+const gatewayForLabel = "tailswarm.gateway.for"
+
 // Port is one TCP port pulled off a service's EndpointSpec. UDP and
 // other protocols are out of scope for v1.
 type Port struct {
@@ -42,6 +50,26 @@ type Target struct {
 	Tag         string
 	Ports       []Port
 	SpecVersion uint64
+
+	// Ingress reports whether the service opted into inbound proxying
+	// (tailswarm.enable=true). When false, Hostname/Tag/Ports are not
+	// populated for ingress and no ingress Proxy is started.
+	Ingress bool
+
+	// Egress is populated when the service opted into outbound proxying
+	// (tailswarm.egress.enable=true). When nil, the service does not
+	// egress. A service may be ingress-only, egress-only, or both.
+	Egress *EgressSpec
+}
+
+// EgressSpec is the parsed egress label set for a service. Hostname is
+// the gateway's tailnet node name; Tag is its tailnet identity (ACL
+// source); Targets is the set of MagicDNS destinations it dials out to.
+type EgressSpec struct {
+	Hostname string
+	Tag      string
+	Network  string
+	Targets  []EgressTarget
 }
 
 // Labels parses tailswarm.* deploy labels off a Swarm service.
@@ -65,9 +93,12 @@ type Labels struct {
 }
 
 var (
-	ErrUnknownNetwork = errors.New("tailswarm: tailswarm.network does not match any of the service's networks")
-	ErrTagNotAllowed  = errors.New("tailswarm: tailswarm.tag does not match any allowed_tags pattern")
-	ErrNoTCPPorts     = errors.New("tailswarm: service has no TCP ports in its endpoint spec")
+	ErrUnknownNetwork    = errors.New("tailswarm: tailswarm.network does not match any of the service's networks")
+	ErrTagNotAllowed     = errors.New("tailswarm: tailswarm.tag does not match any allowed_tags pattern")
+	ErrNoTCPPorts        = errors.New("tailswarm: service has no TCP ports in its endpoint spec")
+	ErrNoEgressTargets   = errors.New("tailswarm: tailswarm.egress.enable is set but tailswarm.egress.targets is empty")
+	ErrBadEgressTarget   = errors.New("tailswarm: tailswarm.egress.targets entry is not host:port")
+	ErrEgressTagNotAllow = errors.New("tailswarm: tailswarm.egress.tag does not match any allowed_tags pattern")
 )
 
 func (l Labels) namespace() string {
@@ -90,10 +121,14 @@ func (l Labels) key(suffix string) string {
 
 // Parse extracts a Target from a Swarm service's deploy labels.
 //
-// The second return value reports whether the service is opted in
-// (tailswarm.enable=true). When false, the Target value is the zero
-// value and err is nil. An error means the service IS opted in but its
-// labels or ports are malformed.
+// The second return value reports whether the service is opted in to
+// anything — ingress (tailswarm.enable=true), egress
+// (tailswarm.egress.enable=true), or both. When false, the Target value
+// is the zero value and err is nil. An error means the service IS opted
+// in but its labels or ports are malformed.
+//
+// Ingress and egress are independent: an egress-only service needs no
+// EndpointSpec.Ports, and an ingress-only service needs no egress labels.
 //
 // `networks` is the full list of swarm networks in the cluster, used
 // only to validate that an explicit tailswarm.network override matches
@@ -101,56 +136,166 @@ func (l Labels) key(suffix string) string {
 func (l Labels) Parse(svc swarm.Service, networks []swarm.Network) (Target, bool, error) {
 	labels := svc.Spec.Labels
 
-	enabled, hasEnable := labels[l.key("enable")]
-	if !hasEnable || !isTrue(enabled) {
+	ingressOn := isTrue(labels[l.key("enable")])
+	egressOn := isTrue(labels[l.key("egress.enable")])
+	if !ingressOn && !egressOn {
 		return Target{}, false, nil
 	}
 
 	stack := labels[stackLabel]
 	serviceName := svc.Spec.Name
 	shortName := strings.TrimPrefix(serviceName, stack+"_")
+	derivedTag := "tag:swarm-" + shortName
+
+	tgt := Target{
+		ServiceID:   svc.ID,
+		ServiceName: serviceName,
+		Stack:       stack,
+		SpecVersion: svc.Version.Index,
+	}
+
+	if ingressOn {
+		if err := l.parseIngress(&tgt, svc, networks, shortName, derivedTag); err != nil {
+			return Target{}, true, err
+		}
+	}
+
+	if egressOn {
+		eg, err := l.parseEgress(svc, networks, stack, shortName, derivedTag)
+		if err != nil {
+			return Target{}, true, err
+		}
+		tgt.Egress = eg
+	}
+
+	return tgt, true, nil
+}
+
+// parseIngress fills the inbound-proxy fields on tgt from the
+// tailswarm.* labels. Mutates tgt in place; returns an error if the
+// service opted into ingress but its network/tag/ports are malformed.
+func (l Labels) parseIngress(tgt *Target, svc swarm.Service, networks []swarm.Network, shortName, derivedTag string) error {
+	labels := svc.Spec.Labels
 
 	network := l.defaultNetwork()
 	if override, ok := labels[l.key("network")]; ok && override != "" {
 		if !serviceAttachedTo(svc, networks, override) {
-			return Target{}, true, fmt.Errorf("%w: %q", ErrUnknownNetwork, override)
+			return fmt.Errorf("%w: %q", ErrUnknownNetwork, override)
 		}
 		network = override
 	}
 
 	hostname := labels[l.key("hostname")]
 	if hostname == "" {
-		if stack != "" {
-			hostname = stack + "-" + shortName
+		if tgt.Stack != "" {
+			hostname = tgt.Stack + "-" + shortName
 		} else {
 			hostname = shortName
 		}
 	}
 
-	derivedTag := "tag:swarm-" + shortName
 	tag := derivedTag
 	if override, ok := labels[l.key("tag")]; ok && override != "" {
 		if !tagAllowed(override, derivedTag, l.AllowedTags) {
-			return Target{}, true, fmt.Errorf("%w: %q", ErrTagNotAllowed, override)
+			return fmt.Errorf("%w: %q", ErrTagNotAllowed, override)
 		}
 		tag = override
 	}
 
 	ports := tcpPorts(svc)
 	if len(ports) == 0 {
-		return Target{}, true, ErrNoTCPPorts
+		return ErrNoTCPPorts
 	}
 
-	return Target{
-		ServiceID:   svc.ID,
-		ServiceName: serviceName,
-		Stack:       stack,
-		Network:     network,
-		Hostname:    hostname,
-		Tag:         tag,
-		Ports:       ports,
-		SpecVersion: svc.Version.Index,
-	}, true, nil
+	tgt.Ingress = true
+	tgt.Network = network
+	tgt.Hostname = hostname
+	tgt.Tag = tag
+	tgt.Ports = ports
+	return nil
+}
+
+// parseEgress builds the EgressSpec from the tailswarm.egress.* labels.
+// The gateway hostname defaults to "<ingress-hostname>-egress" so it is
+// distinct from the ingress node; the tag defaults to the derived tag and
+// may be overridden within allowed_tags. Targets is a comma-separated
+// host:port list with no local-port suffix — the app dials the real name.
+func (l Labels) parseEgress(svc swarm.Service, networks []swarm.Network, stack, shortName, derivedTag string) (*EgressSpec, error) {
+	labels := svc.Spec.Labels
+
+	targets, err := parseEgressTargets(labels[l.key("egress.targets")])
+	if err != nil {
+		return nil, err
+	}
+	if len(targets) == 0 {
+		return nil, ErrNoEgressTargets
+	}
+
+	network := l.defaultNetwork()
+	if override, ok := labels[l.key("egress.network")]; ok && override != "" {
+		if !serviceAttachedTo(svc, networks, override) {
+			return nil, fmt.Errorf("%w: %q", ErrUnknownNetwork, override)
+		}
+		network = override
+	}
+
+	hostname := labels[l.key("egress.hostname")]
+	if hostname == "" {
+		base := shortName
+		if stack != "" {
+			base = stack + "-" + shortName
+		}
+		hostname = base + "-egress"
+	}
+
+	tag := derivedTag
+	if override, ok := labels[l.key("egress.tag")]; ok && override != "" {
+		if !tagAllowed(override, derivedTag, l.AllowedTags) {
+			return nil, fmt.Errorf("%w: %q", ErrEgressTagNotAllow, override)
+		}
+		tag = override
+	}
+
+	return &EgressSpec{
+		Hostname: hostname,
+		Tag:      tag,
+		Network:  network,
+		Targets:  targets,
+	}, nil
+}
+
+// parseEgressTargets parses a comma-separated "host:port, host:port" list
+// into EgressTargets, deduplicated and in declaration order. Blank
+// entries (e.g. trailing commas) are skipped; a malformed entry is an
+// error.
+func parseEgressTargets(raw string) ([]EgressTarget, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	seen := make(map[string]struct{})
+	out := make([]EgressTarget, 0)
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		host, portStr, ok := strings.Cut(entry, ":")
+		host = strings.TrimSpace(host)
+		portStr = strings.TrimSpace(portStr)
+		if !ok || host == "" || portStr == "" {
+			return nil, fmt.Errorf("%w: %q", ErrBadEgressTarget, entry)
+		}
+		port, err := strconv.ParseUint(portStr, 10, 16)
+		if err != nil || port == 0 {
+			return nil, fmt.Errorf("%w: %q", ErrBadEgressTarget, entry)
+		}
+		if _, dup := seen[entry]; dup {
+			continue
+		}
+		seen[entry] = struct{}{}
+		out = append(out, EgressTarget{Host: host, Port: uint32(port)})
+	}
+	return out, nil
 }
 
 func isTrue(s string) bool {

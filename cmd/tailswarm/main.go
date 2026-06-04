@@ -51,6 +51,17 @@ func run(ctx context.Context, args []string, env func(string) string, _, stderr 
 		env = os.Getenv
 	}
 
+	// "gateway" mode is the egress data plane: the same binary deployed by
+	// the control plane as a companion service (see gatewaySpec). It reads
+	// the TAILSWARM_GATEWAY_* env contract instead of the daemon config and
+	// never touches Docker or Headscale's API.
+	if len(args) > 0 && args[0] == "gateway" {
+		logger := slog.New(slog.NewJSONHandler(stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		logger = logger.With("component", "tailswarm-gateway")
+		slog.SetDefault(logger)
+		return tailswarm.RunGateway(ctx, env, logger)
+	}
+
 	fs := flag.NewFlagSet("tailswarm", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	configPath := fs.String("config", env("TAILSWARM_CONFIG"), "path to YAML config file (env: TAILSWARM_CONFIG)")
@@ -114,6 +125,21 @@ func run(ctx context.Context, args []string, env func(string) string, _, stderr 
 	reconciler := tailswarm.NewReconciler(dockerClient, ctrl, store, cfg)
 	reconciler.Log = logger.With("subcomponent", "reconciler")
 	reconciler.NewProxy = newProxy
+
+	// Egress gateways run tailswarm's own image in "gateway" mode, so
+	// discover it from the daemon's own Swarm service rather than asking
+	// the operator to configure (and keep in sync) an image reference.
+	// Failure is non-fatal: a pure-ingress deployment never needs it, and
+	// an egressing service surfaces the misconfiguration as a reconcile
+	// error if the image stayed empty.
+	if hostname, herr := os.Hostname(); herr != nil {
+		logger.Warn("hostname lookup failed; egress gateway image undiscovered", "err", herr)
+	} else if img, derr := tailswarm.DiscoverGatewayImage(ctx, dockerClient, hostname); derr != nil {
+		logger.Warn("egress gateway image undiscovered; egress will be unavailable", "err", derr)
+	} else {
+		reconciler.GatewayImage = img
+		logger.Info("discovered egress gateway image", "image", img)
+	}
 
 	queue := tailswarm.NewQueue(defaultWorkerCount, defaultQueueBuffer)
 	events := make(chan string, defaultEventChanDepth)

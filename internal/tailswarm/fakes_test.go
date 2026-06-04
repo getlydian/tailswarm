@@ -21,12 +21,20 @@ type fakeDocker struct {
 
 	services map[string]*swarm.Service
 	networks []swarm.Network
+	tasks    []swarm.Task
 
 	idSeq atomic.Uint64
 
 	errInspect error
 	errList    error
 	errNets    error
+	errCreate  error
+	errUpdate  error
+	errRemove  error
+
+	created []swarm.ServiceSpec
+	updated []string
+	removed []string
 
 	missing map[string]struct{}
 
@@ -123,6 +131,49 @@ func (f *fakeDocker) InspectService(_ context.Context, serviceID string) (swarm.
 	return *s, nil
 }
 
+func (f *fakeDocker) CreateService(_ context.Context, spec swarm.ServiceSpec) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.errCreate; err != nil {
+		f.errCreate = nil
+		return "", err
+	}
+	id := "gw-" + strconv.FormatUint(f.idSeq.Add(1), 10)
+	svc := swarm.Service{ID: id}
+	svc.Spec = spec
+	svc.Version.Index = 1
+	f.services[id] = &svc
+	f.created = append(f.created, spec)
+	return id, nil
+}
+
+func (f *fakeDocker) UpdateService(_ context.Context, serviceID string, version uint64, spec swarm.ServiceSpec) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.errUpdate; err != nil {
+		f.errUpdate = nil
+		return err
+	}
+	f.updated = append(f.updated, serviceID)
+	if s, ok := f.services[serviceID]; ok {
+		s.Spec = spec
+		s.Version.Index = version + 1
+	}
+	return nil
+}
+
+func (f *fakeDocker) RemoveService(_ context.Context, serviceID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.errRemove; err != nil {
+		f.errRemove = nil
+		return err
+	}
+	f.removed = append(f.removed, serviceID)
+	delete(f.services, serviceID)
+	return nil
+}
+
 func (f *fakeDocker) ListNetworks(_ context.Context) ([]swarm.Network, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -135,6 +186,14 @@ func (f *fakeDocker) ListNetworks(_ context.Context) ([]swarm.Network, error) {
 	}
 	out := make([]swarm.Network, len(f.networks))
 	copy(out, f.networks)
+	return out, nil
+}
+
+func (f *fakeDocker) ListTasks(_ context.Context) ([]swarm.Task, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]swarm.Task, len(f.tasks))
+	copy(out, f.tasks)
 	return out, nil
 }
 
@@ -227,6 +286,54 @@ func (s *fakeTsnetServer) addrs() []net.Addr {
 		out[i] = ln.Addr()
 	}
 	return out
+}
+
+// fakeTsnetDialer is a loopback stand-in for *tsnet.Server on the egress
+// path. Dial ignores the requested MagicDNS addr and instead dials a
+// fixed real loopback target, so startEgressProxyWith can be exercised
+// end-to-end without a tailnet. dialed records every addr it was asked
+// for so tests can assert the gateway dialed the real target name.
+type fakeTsnetDialer struct {
+	mu       sync.Mutex
+	upstream string // real loopback host:port every Dial connects to
+	dialed   []string
+	closed   bool
+	dialErr  error
+}
+
+func (s *fakeTsnetDialer) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	s.mu.Lock()
+	s.dialed = append(s.dialed, addr)
+	derr := s.dialErr
+	up := s.upstream
+	s.mu.Unlock()
+	if derr != nil {
+		return nil, derr
+	}
+	var d net.Dialer
+	return d.DialContext(ctx, network, up)
+}
+
+func (s *fakeTsnetDialer) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	return nil
+}
+
+func (s *fakeTsnetDialer) dialedAddrs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.dialed))
+	copy(out, s.dialed)
+	return out
+}
+
+// listenLoopback is the test seam for startEgressProxyWith: it binds an
+// ephemeral 127.0.0.1 port instead of the target's fixed port, so the
+// test can dial the listener without privilege or port-collision issues.
+func listenLoopback(_ EgressTarget) (net.Listener, error) {
+	return net.Listen("tcp", "127.0.0.1:0")
 }
 
 // fakeProxy is what the fake ProxyFactory returns. It wraps a

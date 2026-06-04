@@ -12,14 +12,19 @@ import (
 	"github.com/docker/docker/client"
 )
 
-// dockerAPI is the subset of *client.Client tailswarm uses. With tsnet
-// in process, only read paths plus the event stream are needed — the
-// reconciler no longer creates, updates, or removes any Docker service.
+// dockerAPI is the subset of *client.Client tailswarm uses. Ingress needs
+// only read paths plus the event stream; egress adds the service write
+// paths used to manage gateway companion services (and nothing else — no
+// containers, secrets, or exec).
 type dockerAPI interface {
 	ServiceList(ctx context.Context, opts swarm.ServiceListOptions) ([]swarm.Service, error)
 	ServiceInspectWithRaw(ctx context.Context, serviceID string, opts swarm.ServiceInspectOptions) (swarm.Service, []byte, error)
 	NetworkList(ctx context.Context, opts networktypes.ListOptions) ([]networktypes.Summary, error)
+	TaskList(ctx context.Context, opts swarm.TaskListOptions) ([]swarm.Task, error)
 	Events(ctx context.Context, opts events.ListOptions) (<-chan events.Message, <-chan error)
+	ServiceCreate(ctx context.Context, spec swarm.ServiceSpec, opts swarm.ServiceCreateOptions) (swarm.ServiceCreateResponse, error)
+	ServiceUpdate(ctx context.Context, serviceID string, version swarm.Version, spec swarm.ServiceSpec, opts swarm.ServiceUpdateOptions) (swarm.ServiceUpdateResponse, error)
+	ServiceRemove(ctx context.Context, serviceID string) error
 	Close() error
 }
 
@@ -98,6 +103,40 @@ func (d *Docker) ListNetworks(ctx context.Context) ([]swarm.Network, error) {
 		})
 	}
 	return out, nil
+}
+
+// ListTasks returns every Swarm task. Used at startup to find the
+// daemon's own task (matched by container ID) and read the image its
+// service runs, so egress gateways deploy that same image.
+func (d *Docker) ListTasks(ctx context.Context) ([]swarm.Task, error) {
+	return d.api.TaskList(ctx, swarm.TaskListOptions{})
+}
+
+// CreateService creates a Swarm service from spec and returns its ID.
+// Used only for egress gateway companions.
+func (d *Docker) CreateService(ctx context.Context, spec swarm.ServiceSpec) (string, error) {
+	resp, err := d.api.ServiceCreate(ctx, spec, swarm.ServiceCreateOptions{})
+	if err != nil {
+		return "", err
+	}
+	return resp.ID, nil
+}
+
+// UpdateService applies spec to an existing service. version must be the
+// service's current Version.Index (Swarm rejects stale writes).
+func (d *Docker) UpdateService(ctx context.Context, serviceID string, version uint64, spec swarm.ServiceSpec) error {
+	_, err := d.api.ServiceUpdate(ctx, serviceID, swarm.Version{Index: version}, spec, swarm.ServiceUpdateOptions{})
+	return err
+}
+
+// RemoveService deletes a service. A missing service is treated as
+// success — teardown is idempotent.
+func (d *Docker) RemoveService(ctx context.Context, serviceID string) error {
+	err := d.api.ServiceRemove(ctx, serviceID)
+	if err != nil && cerrdefs.IsNotFound(err) {
+		return nil
+	}
+	return err
 }
 
 // Subscribe satisfies EventStream.
