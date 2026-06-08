@@ -75,6 +75,81 @@ loop:
 	}
 }
 
+// An egress-only service sets tailswarm.egress.enable=true but no plain
+// tailswarm.enable. The resync must still enqueue it: its only other path
+// to a reconcile is a one-shot Docker event, so if that event-driven
+// reconcile failed (e.g. its Headscale user didn't exist yet), resync is
+// the sole retry — and an ingress-only filter would never re-list it.
+func TestWatcherFullListEnqueuesEgressOnly(t *testing.T) {
+	d := newFakeDocker()
+	d.addService(swarm.Service{
+		ID: "svc-egress-only",
+		Spec: swarm.ServiceSpec{
+			Annotations: swarm.Annotations{Labels: map[string]string{"tailswarm.egress.enable": "true"}},
+		},
+	})
+	d.addService(swarm.Service{
+		ID: "svc-both",
+		Spec: swarm.ServiceSpec{
+			Annotations: swarm.Annotations{Labels: map[string]string{
+				"tailswarm.enable":        "true",
+				"tailswarm.egress.enable": "true",
+			}},
+		},
+	})
+	d.addService(swarm.Service{
+		ID: "svc-off",
+		Spec: swarm.ServiceSpec{
+			Annotations: swarm.Annotations{Labels: map[string]string{}},
+		},
+	})
+
+	out := make(chan string, 8)
+	w := &Watcher{
+		Docker:         d,
+		Events:         newFakeEvents(),
+		Out:            out,
+		FullResync:     50 * time.Millisecond,
+		LabelNamespace: defaultNamespace,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() { defer close(done); _ = w.Run(ctx) }()
+
+	got := map[string]int{}
+loop:
+	for {
+		select {
+		case id := <-out:
+			got[id]++
+		case <-ctx.Done():
+			break loop
+		}
+	}
+	<-done
+	if got["svc-egress-only"] == 0 {
+		t.Errorf("expected egress-only service to be enqueued at least once: %+v", got)
+	}
+	if got["svc-off"] != 0 {
+		t.Errorf("svc-off enqueued: %+v", got)
+	}
+	// A service opting into BOTH must be enqueued once per resync, not
+	// twice — fullList unions the two label lists by ID.
+	if n := got["svc-both"]; n > 0 {
+		// One full resync fires at startup plus possibly more within the
+		// window; assert it never double-counts within a single tick by
+		// checking the count stays at the number of ticks observed for the
+		// egress-only service (both appear in every resync).
+		if n != got["svc-egress-only"] {
+			t.Errorf("svc-both enqueued %d times, expected same as egress-only %d (no per-tick dupes): %+v",
+				n, got["svc-egress-only"], got)
+		}
+	}
+}
+
 func TestWatcherForwardsEvents(t *testing.T) {
 	d := newFakeDocker()
 	ev := newFakeEvents()

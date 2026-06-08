@@ -171,22 +171,40 @@ func (w *Watcher) Run(ctx context.Context) error {
 	}
 }
 
-// fullList enqueues every service carrying the enable label. Errors are
-// logged but never returned: a failed periodic list is recoverable and
-// shouldn't tear down the watcher (the next tick will try again, and
-// events keep flowing).
+// fullList enqueues every service that opts into tailswarm — via ingress
+// (<namespace>.enable=true) OR egress (<namespace>.egress.enable=true).
+// A service may set only one, so both label keys must be listed and their
+// IDs unioned; an egress-only service (e.g. a Thanos query that dials out
+// but exposes no ingress) is invisible to the ingress filter alone, and
+// would then never be re-enqueued by resync — so an initial event-driven
+// reconcile that failed (e.g. its Headscale user not yet created) would
+// never be retried.
+//
+// Docker's label filter can't OR two keys in one ServiceList, so this
+// issues one list per opt-in key and dedupes the IDs. Errors are logged
+// but never returned: a failed periodic list is recoverable and shouldn't
+// tear down the watcher (the next tick will try again, and events keep
+// flowing).
 func (w *Watcher) fullList(ctx context.Context, namespace string, log *slog.Logger) {
-	filter := LabelFilter{Key: namespace + ".enable", Value: "true"}
-	svcs, err := w.Docker.ListServices(ctx, filter)
-	if err != nil {
-		log.Warn("full resync list failed", "err", err)
-		return
-	}
-	for _, s := range svcs {
-		if s.ID == "" {
+	keys := []string{namespace + ".enable", namespace + ".egress.enable"}
+
+	seen := make(map[string]struct{})
+	for _, key := range keys {
+		svcs, err := w.Docker.ListServices(ctx, LabelFilter{Key: key, Value: "true"})
+		if err != nil {
+			log.Warn("full resync list failed", "label", key, "err", err)
 			continue
 		}
-		w.send(ctx, s.ID)
+		for _, s := range svcs {
+			if s.ID == "" {
+				continue
+			}
+			if _, dup := seen[s.ID]; dup {
+				continue
+			}
+			seen[s.ID] = struct{}{}
+			w.send(ctx, s.ID)
+		}
 	}
 }
 
