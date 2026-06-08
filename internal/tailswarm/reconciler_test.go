@@ -74,6 +74,16 @@ func TestReconcileCreatesProxy(t *testing.T) {
 	if got.AuthKey == "" {
 		t.Errorf("authkey not threaded into proxy config")
 	}
+	// Ingress nodes must be persistent so the tailnet IP survives a
+	// deploy. Both the minted key and the proxy config must be
+	// non-ephemeral — an ephemeral node is deleted by Headscale on
+	// disconnect and re-registers with a fresh IP, churning DNS.
+	if c.created[0].Ephemeral {
+		t.Errorf("ingress key minted ephemeral; want persistent so IP is stable across restarts")
+	}
+	if got.Ephemeral {
+		t.Errorf("ingress proxy config is ephemeral; want persistent")
+	}
 }
 
 func TestReconcileNoOpOnUnchangedSpec(t *testing.T) {

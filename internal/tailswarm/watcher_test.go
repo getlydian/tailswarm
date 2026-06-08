@@ -141,10 +141,13 @@ loop:
 	if n := got["svc-both"]; n > 0 {
 		// One full resync fires at startup plus possibly more within the
 		// window; assert it never double-counts within a single tick by
-		// checking the count stays at the number of ticks observed for the
-		// egress-only service (both appear in every resync).
-		if n != got["svc-egress-only"] {
-			t.Errorf("svc-both enqueued %d times, expected same as egress-only %d (no per-tick dupes): %+v",
+		// checking the count tracks the egress-only service (both appear in
+		// every resync). The window can end mid-tick — after one of the two
+		// is drained from the channel but before the other — so allow the
+		// counts to differ by one; a per-tick dupe would diverge by the
+		// number of ticks, not by one.
+		if diff := n - got["svc-egress-only"]; diff < -1 || diff > 1 {
+			t.Errorf("svc-both enqueued %d times, expected within 1 of egress-only %d (no per-tick dupes): %+v",
 				n, got["svc-egress-only"], got)
 		}
 	}
