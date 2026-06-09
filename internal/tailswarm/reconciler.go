@@ -172,15 +172,10 @@ func (r *Reconciler) reconcileIngress(ctx context.Context, serviceID string, tgt
 	if err := r.Limiter.Wait(ctx); err != nil {
 		return fmt.Errorf("rate limit: %w", err)
 	}
-	// Ingress proxies register a *persistent* node: the proxy persists its
-	// tsnet identity to StateDir, so a persistent Headscale node lets the
-	// restarted proxy re-bind to the same node — and keep the same tailnet
-	// IP — across deploys. An ephemeral node would be deleted on disconnect
-	// and re-register with a fresh IP, churning DNS and eating the TTL.
 	key, err := r.Ctrl.CreateEphemeralKey(ctx, KeyRequest{
 		User:       r.Cfg.Headscale.User,
 		Tags:       []string{tgt.Tag},
-		Ephemeral:  false,
+		Ephemeral:  true,
 		Reusable:   false,
 		Expiration: r.Cfg.Headscale.KeyExpiration,
 	})
@@ -617,12 +612,9 @@ func (r *Reconciler) teardownEgress(ctx context.Context, serviceID string) error
 }
 
 // CloseAll tears down every in-process proxy on shutdown. Keys are not
-// expired here: the pre-auth key is single-use (Reusable=false) and has
-// already been consumed at registration, so the live node holds its own
-// identity regardless of the key. Ingress nodes are persistent and are
-// meant to be re-adopted (same IP) on the next start; expiring anything
-// here would only fight that. Egress gateways are deliberately left
-// running: they are independent Docker services that keep forwarding
+// expired here — they're already ephemeral and will lapse on their own
+// once the tsnet servers disconnect. Egress gateways are deliberately
+// left running: they are independent Docker services that keep forwarding
 // across a daemon restart, and the next reconcile re-adopts them by their
 // marker label (see findGateway).
 func (r *Reconciler) CloseAll() {
@@ -655,10 +647,6 @@ func proxyConfigFor(t Target, cfg Config) ProxyConfig {
 		StateDir: cfg.Tsnet.StateDir,
 		LoginURL: cfg.Headscale.URL,
 		Tags:     []string{t.Tag},
-		// Ingress nodes are persistent so their tailnet IP survives a
-		// restart (see reconcileIngress's key mint). Egress gateways are
-		// the ephemeral ones, and they go through a different path.
-		Ephemeral: false,
 	}
 }
 

@@ -24,25 +24,13 @@ type ProxyConfig struct {
 	StateDir string
 	LoginURL string
 	Tags     []string
-
-	// Ephemeral controls whether the tailnet node is registered as
-	// ephemeral. Ingress proxies persist their tsnet identity to StateDir
-	// and want a *persistent* node so the same Headscale record — and thus
-	// the same tailnet IP — is reused across restarts; otherwise Headscale
-	// deletes the node the moment the proxy disconnects on a deploy and the
-	// restarted proxy draws a fresh IP, forcing a DNS update and a TTL
-	// propagation penalty. Egress gateways keep no state and set this true.
-	Ephemeral bool
 }
 
 // Proxy owns one tsnet.Server and the goroutines forwarding TCP traffic
 // from each tailnet listener to the target service on the overlay
 // network. Close shuts everything down and removes the tsnet identity
-// from memory; on-disk state under StateDir survives. When the node is
-// non-ephemeral (ProxyConfig.Ephemeral=false, the ingress default) that
-// state re-binds to the same Headscale node on the next start, so the
-// tailnet IP is stable across restarts. An ephemeral node, by contrast,
-// is deleted by Headscale on disconnect and re-registers with a new IP.
+// from memory; on-disk state survives so the next start re-uses the
+// same Headscale node.
 type Proxy struct {
 	cfg    ProxyConfig
 	srv    tsnetServer
@@ -85,7 +73,7 @@ func NewTsnetProxy(ctx context.Context, cfg ProxyConfig, log *slog.Logger) (*Pro
 		Hostname:  cfg.Hostname,
 		AuthKey:   cfg.AuthKey,
 		Dir:       filepath.Join(cfg.StateDir, cfg.Hostname),
-		Ephemeral: cfg.Ephemeral,
+		Ephemeral: true,
 		Logf:      tsnetLogf(log),
 	}
 	if cfg.LoginURL != "" {
