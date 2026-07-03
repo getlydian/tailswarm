@@ -445,16 +445,16 @@ func (r *Reconciler) createGateway(ctx context.Context, serviceID string, eg *Eg
 // the freshly minted key. The key was already minted by the caller; on any
 // failure it is rolled back so no orphan key survives.
 func (r *Reconciler) adoptExistingGateway(ctx context.Context, serviceID string, eg *EgressSpec, t EgressTarget, spec swarm.ServiceSpec, key Key) (GatewayRef, error) {
-	gws, err := r.Docker.ListServices(ctx, LabelFilter{Name: spec.Annotations.Name})
+	gws, err := r.Docker.ListServices(ctx, LabelFilter{Name: spec.Name})
 	if err != nil {
 		r.expireOrLog(ctx, key.ID, "rollback after gateway adopt lookup failure")
-		return GatewayRef{}, fmt.Errorf("adopt gateway %s: lookup: %w", spec.Annotations.Name, err)
+		return GatewayRef{}, fmt.Errorf("adopt gateway %s: lookup: %w", spec.Name, err)
 	}
 	if len(gws) == 0 {
 		// It vanished between the create collision and this lookup — a plain
 		// retry next pass will recreate it cleanly.
 		r.expireOrLog(ctx, key.ID, "rollback after gateway adopt vanished")
-		return GatewayRef{}, fmt.Errorf("adopt gateway %s: create reported exists but not found on lookup", spec.Annotations.Name)
+		return GatewayRef{}, fmt.Errorf("adopt gateway %s: create reported exists but not found on lookup", spec.Name)
 	}
 	existing := gws[0]
 
@@ -464,7 +464,7 @@ func (r *Reconciler) adoptExistingGateway(ctx context.Context, serviceID string,
 	}
 	r.Log.Info("adopted existing gateway",
 		"service_id", serviceID, "gateway_id", existing.ID,
-		"name", spec.Annotations.Name, "target", t.addr())
+		"name", spec.Name, "target", t.addr())
 	return GatewayRef{
 		Target:    t.addr(),
 		ServiceID: existing.ID,
