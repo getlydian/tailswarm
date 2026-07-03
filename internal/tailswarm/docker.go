@@ -60,16 +60,36 @@ var (
 
 func (d *Docker) ListServices(ctx context.Context, filter LabelFilter) ([]swarm.Service, error) {
 	opts := swarm.ServiceListOptions{}
-	if filter.Key != "" {
+	if filter.Key != "" || filter.Name != "" {
 		args := filters.NewArgs()
-		if filter.Value != "" {
-			args.Add("label", filter.Key+"="+filter.Value)
-		} else {
-			args.Add("label", filter.Key)
+		if filter.Key != "" {
+			if filter.Value != "" {
+				args.Add("label", filter.Key+"="+filter.Value)
+			} else {
+				args.Add("label", filter.Key)
+			}
+		}
+		if filter.Name != "" {
+			args.Add("name", filter.Name)
 		}
 		opts.Filters = args
 	}
-	return d.api.ServiceList(ctx, opts)
+	svcs, err := d.api.ServiceList(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	// Docker's "name" filter is a substring match; narrow to an exact hit so
+	// the caller adopting a gateway by name never picks up a longer sibling.
+	if filter.Name != "" {
+		out := svcs[:0]
+		for _, s := range svcs {
+			if s.Spec.Name == filter.Name {
+				out = append(out, s)
+			}
+		}
+		svcs = out
+	}
+	return svcs, nil
 }
 
 func (d *Docker) InspectService(ctx context.Context, serviceID string) (swarm.Service, error) {
@@ -117,6 +137,12 @@ func (d *Docker) ListTasks(ctx context.Context) ([]swarm.Task, error) {
 func (d *Docker) CreateService(ctx context.Context, spec swarm.ServiceSpec) (string, error) {
 	resp, err := d.api.ServiceCreate(ctx, spec, swarm.ServiceCreateOptions{})
 	if err != nil {
+		// A duplicate service name comes back as HTTP 409, which the client
+		// maps to cerrdefs.ErrConflict. Normalise it so the reconciler can
+		// adopt the existing gateway instead of failing the whole pass.
+		if cerrdefs.IsConflict(err) {
+			return "", ErrServiceExists
+		}
 		return "", err
 	}
 	return resp.ID, nil

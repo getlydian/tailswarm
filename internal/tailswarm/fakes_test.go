@@ -105,6 +105,9 @@ func (f *fakeDocker) ListServices(_ context.Context, filter LabelFilter) ([]swar
 				continue
 			}
 		}
+		if filter.Name != "" && s.Spec.Name != filter.Name {
+			continue
+		}
 		out = append(out, *s)
 	}
 	return out, nil
@@ -137,6 +140,13 @@ func (f *fakeDocker) CreateService(_ context.Context, spec swarm.ServiceSpec) (s
 	if err := f.errCreate; err != nil {
 		f.errCreate = nil
 		return "", err
+	}
+	// Mirror Docker: a duplicate service name is rejected. The reconciler
+	// adopts the existing service on this error.
+	for _, s := range f.services {
+		if s.Spec.Name != "" && s.Spec.Name == spec.Name {
+			return "", ErrServiceExists
+		}
 	}
 	id := "gw-" + strconv.FormatUint(f.idSeq.Add(1), 10)
 	svc := swarm.Service{ID: id}

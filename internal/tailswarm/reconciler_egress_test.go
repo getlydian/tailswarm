@@ -569,6 +569,84 @@ func TestReconcileGatewayCreateFailureExpiresKey(t *testing.T) {
 	}
 }
 
+// Regression: when the owning app service is recreated under a new Swarm
+// ID, its egress gateway keeps its stable name but carries the OLD app ID
+// in its gatewayForLabel marker. Adoption (which matches on the marker)
+// misses it, and a blind CreateService collides on the name. The reconciler
+// must adopt the existing gateway by name and update it in place —
+// re-stamping the marker to the new app ID — instead of erroring every pass.
+func TestReconcileGatewayAdoptedAfterAppServiceRecreated(t *testing.T) {
+	r, d, c := testEgressReconciler(t)
+
+	// First incarnation: create the app and its gateway.
+	oldID := d.addService(egressService("admin_phpmyadmin", "db-mysql:3306"))
+	if err := r.Reconcile(context.Background(), oldID); err != nil {
+		t.Fatal(err)
+	}
+	if len(d.created) != 1 {
+		t.Fatalf("setup: expected 1 gateway created, got %d", len(d.created))
+	}
+	gwName := d.created[0].Name
+	// Confirm the live gateway is marked for the old app ID.
+	var gwID string
+	for id, s := range d.services {
+		if s.Spec.Name == gwName {
+			gwID = id
+			if got := s.Spec.Labels[gatewayForLabel]; got != oldID {
+				t.Fatalf("gateway marker = %q, want old app id %q", got, oldID)
+			}
+		}
+	}
+	if gwID == "" {
+		t.Fatal("setup: gateway service not found")
+	}
+
+	// The app is redeployed under a NEW Swarm service ID, and tailswarm's
+	// in-memory store is lost (daemon restart). The old gateway keeps running
+	// under its stable name with the now-stale marker.
+	delete(d.services, oldID)
+	r.Store = NewStore()
+	newID := d.addService(egressService("admin_phpmyadmin", "db-mysql:3306"))
+	d.created = nil
+	d.updated = nil
+
+	// This is the pass that used to log "AlreadyExists" forever.
+	if err := r.Reconcile(context.Background(), newID); err != nil {
+		t.Fatalf("reconcile under new app id errored instead of adopting: %v", err)
+	}
+
+	// No new gateway service was created (the name still exists)...
+	if len(d.created) != 0 {
+		t.Errorf("recreated %d gateway(s) instead of adopting", len(d.created))
+	}
+	// ...the existing one was updated in place...
+	if len(d.updated) != 1 || d.updated[0] != gwID {
+		t.Errorf("expected in-place update of %s, got updated=%v", gwID, d.updated)
+	}
+	// ...its marker now points at the NEW app id...
+	if got := d.services[gwID].Spec.Labels[gatewayForLabel]; got != newID {
+		t.Errorf("marker after adopt = %q, want new app id %q", got, newID)
+	}
+	// ...it is tracked under the new app id...
+	e, ok := r.Store.Get(newID)
+	if !ok || len(e.Gateways) != 1 || e.Gateways[0].ServiceID != gwID {
+		t.Errorf("adopted gateway not tracked under new app id: ok=%v entry=%+v", ok, e)
+	}
+	// ...and no key was leaked (the adopt-mint key is the one now tracked).
+	if len(c.expired) != 0 {
+		t.Errorf("adopt should not expire keys (adopted gateway's old key is unknown/ephemeral): expired=%v", c.expired)
+	}
+
+	// And it is now steady: a follow-up pass creates/updates nothing.
+	d.created, d.updated = nil, nil
+	if err := r.Reconcile(context.Background(), newID); err != nil {
+		t.Fatalf("follow-up reconcile errored: %v", err)
+	}
+	if len(d.created) != 0 || len(d.updated) != 0 {
+		t.Errorf("not converged: created=%d updated=%d", len(d.created), len(d.updated))
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

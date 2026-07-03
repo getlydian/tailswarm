@@ -23,11 +23,23 @@ import (
 // teardown trigger.
 var ErrServiceNotFound = errors.New("tailswarm: docker service not found")
 
+// ErrServiceExists is what DockerClient.CreateService returns when a
+// service with the same name already exists (Docker replies 409). The
+// reconciler treats this as "adopt the existing service and reconcile it"
+// rather than a hard failure — a gateway whose owning app service was
+// recreated under a new Swarm ID keeps its stable name, so its stale
+// gatewayForLabel hides it from adoption and a blind create collides.
+var ErrServiceExists = errors.New("tailswarm: docker service already exists")
+
 // LabelFilter narrows ListServices to services carrying a particular
 // label. Empty Value matches the label's presence regardless of value.
+// Name, if set, additionally restricts the result to services with that
+// exact name — used to adopt an existing gateway by its stable name after
+// a create collides (the app-id marker label having gone stale).
 type LabelFilter struct {
 	Key   string
 	Value string
+	Name  string
 }
 
 // DockerClient is the Docker API surface tailswarm uses. The read paths
@@ -406,6 +418,14 @@ func (r *Reconciler) createGateway(ctx context.Context, serviceID string, eg *Eg
 
 	spec := gatewaySpec(eg, t, serviceID, r.Cfg, r.GatewayImage, key.Secret)
 	id, err := r.Docker.CreateService(ctx, spec)
+	if errors.Is(err, ErrServiceExists) {
+		// A gateway with this (stable) name already runs, but adoption missed
+		// it — its gatewayForLabel still points at a prior incarnation of the
+		// app service (recreated under a new Swarm ID). Adopt it by name and
+		// update it in place: the desired spec re-stamps the marker to the
+		// current app ID and installs the freshly minted key.
+		return r.adoptExistingGateway(ctx, serviceID, eg, t, spec, key)
+	}
 	if err != nil {
 		r.expireOrLog(ctx, key.ID, "rollback after gateway create failure")
 		return GatewayRef{}, fmt.Errorf("create gateway for %s target %s: %w", serviceID, t.addr(), err)
@@ -413,6 +433,41 @@ func (r *Reconciler) createGateway(ctx context.Context, serviceID string, eg *Eg
 	return GatewayRef{
 		Target:    t.addr(),
 		ServiceID: id,
+		KeyID:     key.ID,
+		Hash:      targetGatewayHash(eg, t, r.GatewayImage),
+	}, nil
+}
+
+// adoptExistingGateway reconciles a gateway that already exists under its
+// stable name but whose stale gatewayForLabel hid it from adoption. It
+// finds the live service by name and updates it in place to spec, which
+// re-stamps the marker label to the current app service ID and rotates in
+// the freshly minted key. The key was already minted by the caller; on any
+// failure it is rolled back so no orphan key survives.
+func (r *Reconciler) adoptExistingGateway(ctx context.Context, serviceID string, eg *EgressSpec, t EgressTarget, spec swarm.ServiceSpec, key Key) (GatewayRef, error) {
+	gws, err := r.Docker.ListServices(ctx, LabelFilter{Name: spec.Annotations.Name})
+	if err != nil {
+		r.expireOrLog(ctx, key.ID, "rollback after gateway adopt lookup failure")
+		return GatewayRef{}, fmt.Errorf("adopt gateway %s: lookup: %w", spec.Annotations.Name, err)
+	}
+	if len(gws) == 0 {
+		// It vanished between the create collision and this lookup — a plain
+		// retry next pass will recreate it cleanly.
+		r.expireOrLog(ctx, key.ID, "rollback after gateway adopt vanished")
+		return GatewayRef{}, fmt.Errorf("adopt gateway %s: create reported exists but not found on lookup", spec.Annotations.Name)
+	}
+	existing := gws[0]
+
+	if err := r.Docker.UpdateService(ctx, existing.ID, existing.Version.Index, spec); err != nil {
+		r.expireOrLog(ctx, key.ID, "rollback after gateway adopt update failure")
+		return GatewayRef{}, fmt.Errorf("adopt gateway %s: update: %w", existing.ID, err)
+	}
+	r.Log.Info("adopted existing gateway",
+		"service_id", serviceID, "gateway_id", existing.ID,
+		"name", spec.Annotations.Name, "target", t.addr())
+	return GatewayRef{
+		Target:    t.addr(),
+		ServiceID: existing.ID,
 		KeyID:     key.ID,
 		Hash:      targetGatewayHash(eg, t, r.GatewayImage),
 	}, nil
