@@ -4,7 +4,9 @@ import (
 	"context"
 	"io"
 	"net"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -103,6 +105,58 @@ func TestProxyCloseStopsListeners(t *testing.T) {
 	addrs := srv.addrs()
 	if _, err := net.DialTimeout("tcp", addrs[0].String(), 100*time.Millisecond); err == nil {
 		t.Fatal("expected dial to fail after Close")
+	}
+}
+
+// TestForwardTCPReleasesGoroutinesPerConn pins the connection-scoped
+// watchdog. The proxy context outlives every connection, so a watchdog
+// parked on it accumulates one goroutine per connection — each pinning
+// both net.Conns — and the daemon grows until it is OOM-killed.
+func TestForwardTCPReleasesGoroutinesPerConn(t *testing.T) {
+	upstream := startEcho(t)
+	dial := overlayDialer(upstream)
+
+	// A proxy-lifetime context, as startProxyOn hands to acceptLoop.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runtime.GC()
+	before := runtime.NumGoroutine()
+
+	const conns = 100
+	var wg sync.WaitGroup
+	for range conns {
+		client, server := net.Pipe()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			forwardTCP(ctx, server, upstream, dial, nil)
+		}()
+		if _, err := client.Write([]byte("ping")); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		buf := make([]byte, 4)
+		if _, err := io.ReadFull(client, buf); err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		_ = client.Close()
+	}
+	wg.Wait()
+
+	// The pump and watchdog goroutines unwind asynchronously once
+	// forwardTCP returns; give them a moment before counting.
+	deadline := time.Now().Add(2 * time.Second)
+	var after int
+	for time.Now().Before(deadline) {
+		runtime.GC()
+		after = runtime.NumGoroutine()
+		if after-before < conns/2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if after-before >= conns/2 {
+		t.Fatalf("leaked %d goroutines after %d closed connections", after-before, conns)
 	}
 }
 

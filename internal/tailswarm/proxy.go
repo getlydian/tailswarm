@@ -177,18 +177,25 @@ func forwardTCP(ctx context.Context, conn net.Conn, target string, dial dialFunc
 	}
 	defer func() { _ = upstream.Close() }()
 
-	// Cancel both halves when ctx fires so a shutdown unblocks the
-	// io.Copy pumps that would otherwise wait on Read forever.
+	// Cancel both halves when ctx fires so a shutdown unblocks the io.Copy
+	// pumps that would otherwise wait on Read forever. connCtx is scoped to
+	// this connection, not to the proxy: a watchdog parked on the long-lived
+	// proxy context would outlive every connection it was started for and
+	// pin both net.Conns (and their tsnet buffers) until proxy teardown.
+	connCtx, done := context.WithCancel(ctx)
+	defer done()
 	go func() {
-		<-ctx.Done()
+		<-connCtx.Done()
 		_ = conn.Close()
 		_ = upstream.Close()
 	}()
 
-	done := make(chan struct{}, 2)
-	go func() { _, _ = io.Copy(upstream, conn); done <- struct{}{} }()
-	go func() { _, _ = io.Copy(conn, upstream); done <- struct{}{} }()
-	<-done
+	// One pump finishing means the peer hung up; returning cancels connCtx,
+	// which closes both ends and unblocks the other pump.
+	half := make(chan struct{}, 2)
+	go func() { _, _ = io.Copy(upstream, conn); half <- struct{}{} }()
+	go func() { _, _ = io.Copy(conn, upstream); half <- struct{}{} }()
+	<-half
 }
 
 // tsnetLogf adapts a slog.Logger into the tsnet logf signature so we get
