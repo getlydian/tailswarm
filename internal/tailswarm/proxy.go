@@ -9,6 +9,7 @@ import (
 	"net"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"tailscale.com/tsnet"
 )
@@ -80,11 +81,11 @@ func NewTsnetProxy(ctx context.Context, cfg ProxyConfig, log *slog.Logger) (*Pro
 		srv.ControlURL = cfg.LoginURL
 	}
 
-	if err := srv.Start(); err != nil {
+	if err := startTsnetBounded(ctx, srv, cfg.Hostname, tsnetStartTimeout, log); err != nil {
 		if log != nil {
 			log.Error("tsnet start failed", "hostname", cfg.Hostname, "err", err)
 		}
-		return nil, fmt.Errorf("tsnet start %s: %w", cfg.Hostname, err)
+		return nil, err
 	}
 
 	return startProxyOn(ctx, srv, cfg, log)
@@ -207,5 +208,59 @@ func tsnetLogf(log *slog.Logger) func(string, ...any) {
 	}
 	return func(format string, args ...any) {
 		log.Debug(fmt.Sprintf(format, args...))
+	}
+}
+
+// tsnetStartTimeout bounds how long a single tsnet bring-up may spend
+// registering with Headscale. tsnet.Server.Start retries control-plane
+// registration indefinitely, so without a bound one unreachable or
+// rejecting control plane parks a reconcile worker forever — and with
+// every worker parked, the queue stops draining and the watcher's resync
+// ticker never runs again. Failing the reconcile instead lets the next
+// full resync retry it.
+const tsnetStartTimeout = 90 * time.Second
+
+// tsnetStarter is the subset of *tsnet.Server that startTsnetBounded
+// drives. Tests supply a fake that blocks forever.
+type tsnetStarter interface {
+	Start() error
+	Close() error
+}
+
+// startTsnetBounded runs srv.Start with a ceiling on how long it may
+// block. Start has no context, so the call is left running in its own
+// goroutine on timeout and the server is closed to unblock it; the
+// goroutine is detached deliberately rather than leaked unboundedly,
+// because Close is what makes Start return.
+//
+// Returns a non-nil error on timeout or ctx cancellation so the caller
+// treats the bring-up as failed and retries later.
+func startTsnetBounded(ctx context.Context, srv tsnetStarter, hostname string, timeout time.Duration, log *slog.Logger) error {
+	if timeout <= 0 {
+		timeout = tsnetStartTimeout
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- srv.Start() }()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case err := <-done:
+		return err
+
+	case <-timer.C:
+		if log != nil {
+			log.Error("tsnet start timed out; abandoning bring-up",
+				"hostname", hostname, "timeout", timeout)
+		}
+		// Close unblocks the in-flight Start so its goroutine exits.
+		go func() { _ = srv.Close() }()
+		return fmt.Errorf("tsnet start %s: timed out after %s", hostname, timeout)
+
+	case <-ctx.Done():
+		go func() { _ = srv.Close() }()
+		return fmt.Errorf("tsnet start %s: %w", hostname, ctx.Err())
 	}
 }

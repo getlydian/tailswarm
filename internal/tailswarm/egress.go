@@ -89,11 +89,11 @@ func NewTsnetEgressProxy(ctx context.Context, cfg EgressConfig, log *slog.Logger
 		srv.ControlURL = cfg.LoginURL
 	}
 
-	if err := srv.Start(); err != nil {
+	if err := startTsnetBounded(ctx, srv, cfg.Hostname, tsnetStartTimeout, log); err != nil {
 		if log != nil {
 			log.Error("tsnet start failed", "hostname", cfg.Hostname, "err", err)
 		}
-		return nil, fmt.Errorf("tsnet start %s: %w", cfg.Hostname, err)
+		return nil, err
 	}
 
 	return startEgressProxyOn(ctx, srv, cfg, log)

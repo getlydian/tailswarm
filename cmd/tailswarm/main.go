@@ -170,7 +170,13 @@ func run(ctx context.Context, args []string, env func(string) string, _, stderr 
 				if !ok {
 					return
 				}
-				queue.Enqueue(id)
+				// A refused enqueue means that shard's worker is stuck.
+				// Log it and move on: the next full resync retries, and
+				// blocking here would stall the watcher's ticker too.
+				if !queue.Enqueue(id) {
+					logger.Warn("reconcile queue full; dropping enqueue until next resync",
+						"service_id", id)
+				}
 			}
 		}
 	}()

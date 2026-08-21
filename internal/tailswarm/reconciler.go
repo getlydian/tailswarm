@@ -775,17 +775,35 @@ func NewQueue(workers, buffer int) *Queue {
 	return q
 }
 
-func (q *Queue) Enqueue(serviceID string) {
+// Enqueue marks serviceID pending and hands it to its shard worker,
+// reporting whether it was accepted. It never blocks: a full shard means
+// its worker is wedged (a stuck reconcile), and blocking here propagates
+// that stall back through the event pump into the watcher, killing the
+// full-resync ticker for the whole process. Dropping instead is safe
+// because the periodic resync re-enqueues every opted-in service — the
+// work is delayed, not lost.
+//
+// A dropped ID must not stay marked pending, or dedupe would suppress
+// every later attempt and the service would never reconcile again.
+func (q *Queue) Enqueue(serviceID string) bool {
 	s := q.shardFor(serviceID)
 	s.mu.Lock()
 	if _, dup := s.pending[serviceID]; dup {
 		s.mu.Unlock()
-		return
+		return true
 	}
 	s.pending[serviceID] = struct{}{}
 	s.mu.Unlock()
 
-	s.ch <- serviceID
+	select {
+	case s.ch <- serviceID:
+		return true
+	default:
+		s.mu.Lock()
+		delete(s.pending, serviceID)
+		s.mu.Unlock()
+		return false
+	}
 }
 
 func (q *Queue) Run(ctx context.Context, fn func(ctx context.Context, serviceID string)) {

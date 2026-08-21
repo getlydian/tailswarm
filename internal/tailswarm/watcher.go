@@ -163,7 +163,10 @@ func (w *Watcher) Run(ctx context.Context) error {
 			if ev.ServiceID == "" {
 				continue
 			}
-			w.send(ctx, ev.ServiceID)
+			if !w.send(ctx, ev.ServiceID) {
+				log.Warn("dropped event enqueue; consumer is behind",
+					"service_id", ev.ServiceID)
+			}
 
 		case <-resubTimer:
 			subscribe()
@@ -189,6 +192,7 @@ func (w *Watcher) fullList(ctx context.Context, namespace string, log *slog.Logg
 	keys := []string{namespace + ".enable", namespace + ".egress.enable"}
 
 	seen := make(map[string]struct{})
+	dropped := 0
 	for _, key := range keys {
 		svcs, err := w.Docker.ListServices(ctx, LabelFilter{Key: key, Value: "true"})
 		if err != nil {
@@ -203,17 +207,39 @@ func (w *Watcher) fullList(ctx context.Context, namespace string, log *slog.Logg
 				continue
 			}
 			seen[s.ID] = struct{}{}
-			w.send(ctx, s.ID)
+			if !w.send(ctx, s.ID) {
+				dropped++
+			}
 		}
+	}
+	if dropped > 0 {
+		log.Warn("full resync dropped enqueues; consumer is behind",
+			"dropped", dropped)
 	}
 }
 
-// send pushes id to Out, respecting ctx so a cancelled watcher doesn't
-// block forever on a full channel.
-func (w *Watcher) send(ctx context.Context, id string) {
+// send offers id to Out without ever blocking the caller. fullList runs
+// on Run's own goroutine, so a blocking send on a full Out would stop
+// the select loop from servicing ticker.C — the periodic resync would
+// die for the life of the process, which is exactly the liveness bug
+// this avoids. A full Out means the consumer is behind; the next resync
+// re-enqueues, so dropping delays work rather than losing it.
+//
+// Reports whether the send was accepted.
+func (w *Watcher) send(ctx context.Context, id string) bool {
+	// Cancellation is checked first and on its own: in a single select
+	// with a ready send, Go would pick between them at random.
 	select {
 	case <-ctx.Done():
+		return false
+	default:
+	}
+
+	select {
 	case w.Out <- id:
+		return true
+	default:
+		return false
 	}
 }
 
