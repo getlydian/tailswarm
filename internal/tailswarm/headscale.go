@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -26,6 +27,10 @@ type Headscale struct {
 	APIKey  string
 	HTTP    *http.Client
 
+	// userIDCache is read and written by every reconcile worker
+	// concurrently, so it needs the mutex — an unguarded map write here
+	// is a fatal runtime error, not a lost cache entry.
+	userIDMu    sync.Mutex
 	userIDCache map[string]string
 }
 
@@ -123,7 +128,10 @@ func (h *Headscale) ExpireKey(ctx context.Context, keyID string) error {
 }
 
 func (h *Headscale) resolveUserID(ctx context.Context, name string) (string, error) {
-	if id, ok := h.userIDCache[name]; ok {
+	h.userIDMu.Lock()
+	id, ok := h.userIDCache[name]
+	h.userIDMu.Unlock()
+	if ok {
 		return id, nil
 	}
 
@@ -139,10 +147,12 @@ func (h *Headscale) resolveUserID(ctx context.Context, name string) (string, err
 	}
 	for _, u := range resp.Users {
 		if u.Name == name && u.ID != "" {
+			h.userIDMu.Lock()
 			if h.userIDCache == nil {
 				h.userIDCache = map[string]string{}
 			}
 			h.userIDCache[name] = u.ID
+			h.userIDMu.Unlock()
 			return u.ID, nil
 		}
 	}

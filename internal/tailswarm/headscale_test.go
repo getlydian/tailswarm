@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -97,5 +99,46 @@ func TestHeadscaleErrorClassification(t *testing.T) {
 	}
 	if !hErr.IsServerError() || hErr.IsClientError() {
 		t.Fatalf("classification wrong: %+v", hErr)
+	}
+}
+
+// resolveUserID is called from every reconcile worker at once, so its
+// cache must be safe under concurrency. Unguarded, this trips Go's
+// "concurrent map writes" fatal error — which kills the process rather
+// than failing the reconcile. Run under -race to catch the read side too.
+func TestHeadscaleResolveUserIDConcurrent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/user" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"users":[{"id":"7","name":"swarm@example.com"}]}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	h := &Headscale{BaseURL: srv.URL, APIKey: "k"}
+
+	const workers = 16
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			id, err := h.resolveUserID(context.Background(), "swarm@example.com")
+			if err != nil {
+				errs <- err
+				return
+			}
+			if id != "7" {
+				errs <- fmt.Errorf("id = %q, want 7", id)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("resolveUserID: %v", err)
 	}
 }
