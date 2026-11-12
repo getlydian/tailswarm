@@ -118,6 +118,9 @@ func (s *stubController) CreateEphemeralKey(_ context.Context, _ tailswarm.KeyRe
 	s.created++
 	return tailswarm.Key{ID: "k-" + strconv.Itoa(s.created), Secret: "x", ExpiresAt: time.Now().Add(time.Minute)}, nil
 }
+func (s *stubController) NodeOnline(_ context.Context, _ string) (bool, error) {
+	return true, nil
+}
 func (s *stubController) ExpireKey(_ context.Context, _ string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

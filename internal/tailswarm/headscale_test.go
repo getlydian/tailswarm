@@ -85,6 +85,37 @@ func TestHeadscaleExpireKey(t *testing.T) {
 	}
 }
 
+// A gateway that died leaves its ephemeral node behind, offline, until
+// Headscale reaps it; the replacement registers under the same name. Any
+// online node by that name counts.
+func TestHeadscaleNodeOnline(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/node" {
+			http.Error(w, "unexpected", http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"nodes": []map[string]any{
+				{"name": "gw-a", "givenName": "gw-a", "online": false},
+				{"name": "gw-a", "givenName": "gw-a-x1y2", "online": true},
+				{"name": "gw-b", "givenName": "gw-b", "online": false},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	h := &Headscale{BaseURL: srv.URL, APIKey: "x"}
+	for hostname, want := range map[string]bool{"gw-a": true, "gw-b": false, "gw-c": false} {
+		got, err := h.NodeOnline(context.Background(), hostname)
+		if err != nil {
+			t.Fatalf("%s: %v", hostname, err)
+		}
+		if got != want {
+			t.Errorf("%s online: got %v want %v", hostname, got, want)
+		}
+	}
+}
+
 func TestHeadscaleErrorClassification(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)

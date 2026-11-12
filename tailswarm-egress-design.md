@@ -361,6 +361,19 @@ introduces `tag:svc-*` as a **source**.
       `UpdateService`) comes up `NeedsLogin` and must re-register. Ephemeral
       keys are single-use, so an update mints a new key and expires the old
       one — it cannot reuse the prior key. (2026-06-04)
+- [x] Gateway restarted by anything but an update (node reboot, reschedule,
+      `docker service update --force`): **re-keyed by the daemon**. The
+      task comes back with the spent or expired key still in its spec and
+      sits at `NeedsLogin` for good, accepting app connections it can never
+      forward. Each full resync asks Headscale whether a gateway whose key
+      has expired is online; if not, it gets the same in-place update as a
+      drifted one, with a fresh key. A gateway still inside its key's
+      lifetime may yet register and is left alone; adopted gateways have no
+      known key and count as expired. A failed Headscale lookup restarts
+      nothing. Rejected: a long-lived reusable key in the spec, which would
+      let anyone who can read the swarm enrol nodes under the egress tag.
+      Surfaced by prd's Loki gateway stuck at `NeedsLogin` from at least
+      2026-10-25. (2026-11-12)
 - [x] Local ports: **none** — the alias model dials the real name, so the
       `@local-port` / auto-assign question is moot. (2026-06-04)
 - [x] Gateway image: **tailswarm's own image** in a `gateway` subcommand,
@@ -371,8 +384,9 @@ introduces `tag:svc-*` as a **source**.
       same labels block — yes, independent. (2026-06-04)
 - [x] Gateway placement constraints / restart policy defaults: **none —
       rely on Swarm defaults** (1 replica, restart-on-failure). The gateway
-      is a stateless forwarder; tsnet identity is keyed on hostname+state
-      dir, so a reschedule re-registers cleanly. Add constraints later only
+      is a stateless forwarder, so a reschedule re-registers — given a key
+      it can still use, which the daemon's re-keying (above) supplies.
+      Add constraints later only
       if a deployment needs the gateway pinned near its app. (2026-06-04)
 - [x] Debounce strategy for alias updates under rapid target churn:
       **none beyond the existing reconcile machinery**. The per-serviceID

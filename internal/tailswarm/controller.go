@@ -29,9 +29,13 @@ type Key struct {
 // Controller is the control-plane abstraction. With tsnet there is no
 // per-service container that needs orphan-sweep cleanup: ephemeral keys
 // produce ephemeral nodes that Headscale removes when the tsnet server
-// disconnects. The interface therefore exposes only key minting and
-// expiration.
+// disconnects. The interface therefore exposes key minting and expiration,
+// plus NodeOnline so an egress gateway that can no longer register with
+// the key in its spec can be told apart from one that is up.
 type Controller interface {
 	CreateEphemeralKey(ctx context.Context, req KeyRequest) (Key, error)
 	ExpireKey(ctx context.Context, keyID string) error
+	// NodeOnline reports whether any node registered under hostname is
+	// currently connected to the tailnet.
+	NodeOnline(ctx context.Context, hostname string) (bool, error)
 }

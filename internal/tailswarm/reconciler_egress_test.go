@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/docker/docker/api/types/swarm"
 )
@@ -644,6 +646,138 @@ func TestReconcileGatewayAdoptedAfterAppServiceRecreated(t *testing.T) {
 	}
 	if len(d.created) != 0 || len(d.updated) != 0 {
 		t.Errorf("not converged: created=%d updated=%d", len(d.created), len(d.updated))
+	}
+}
+
+// gatewayTailnetName reads the tailnet hostname a gateway registers under
+// from its spec, the name NodeOnline is asked about.
+func gatewayTailnetName(t *testing.T, d *fakeDocker, ref GatewayRef) string {
+	t.Helper()
+	prefix := envGatewayHostname + "="
+	for _, e := range d.services[ref.ServiceID].Spec.TaskTemplate.ContainerSpec.Env {
+		if strings.HasPrefix(e, prefix) {
+			return strings.TrimPrefix(e, prefix)
+		}
+	}
+	t.Fatalf("gateway %s has no %s", ref.ServiceID, envGatewayHostname)
+	return ""
+}
+
+// expireGatewayKeys moves every tracked gateway key's expiry into the past,
+// as if the gateway had been running longer than the key lifetime.
+func expireGatewayKeys(r *Reconciler, serviceID string) {
+	e, _ := r.Store.Get(serviceID)
+	for i := range e.Gateways {
+		e.Gateways[i].KeyExpiresAt = time.Now().Add(-time.Second)
+	}
+	r.Store.Put(serviceID, e)
+}
+
+// A gateway's task restarted after its single-use key expired (a node
+// reboot, a reschedule): it can never register again with the key in its
+// spec, so it is re-keyed in place, which restarts it with a fresh key.
+func TestReconcileRekeysGatewayOffTailnetWithExpiredKey(t *testing.T) {
+	r, d, c := testEgressReconciler(t)
+	id := d.addService(egressService("admin_phpmyadmin", "db-mysql:3306"))
+	if err := r.Reconcile(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := r.Store.Get(id)
+	ref := before.Gateways[0]
+	c.offline = map[string]bool{gatewayTailnetName(t, d, ref): true}
+	expireGatewayKeys(r, id)
+
+	if err := r.Reconcile(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(d.updated) != 1 || d.updated[0] != ref.ServiceID {
+		t.Fatalf("gateway not re-keyed in place: updated=%+v want [%s]", d.updated, ref.ServiceID)
+	}
+	if len(c.expired) != 1 || c.expired[0] != ref.KeyID {
+		t.Errorf("old key not expired: %+v want [%s]", c.expired, ref.KeyID)
+	}
+	after, _ := r.Store.Get(id)
+	if g := after.Gateways[0]; g.KeyID == ref.KeyID || !g.KeyExpiresAt.After(time.Now()) {
+		t.Errorf("store not carrying the fresh key: %+v", g)
+	}
+}
+
+// A gateway still inside its key's lifetime may simply not have finished
+// registering, so it is left alone.
+func TestReconcileLeavesRegisteringGatewayAlone(t *testing.T) {
+	r, d, c := testEgressReconciler(t)
+	id := d.addService(egressService("admin_phpmyadmin", "db-mysql:3306"))
+	if err := r.Reconcile(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	e, _ := r.Store.Get(id)
+	c.offline = map[string]bool{gatewayTailnetName(t, d, e.Gateways[0]): true}
+
+	if err := r.Reconcile(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	if len(d.updated) != 0 {
+		t.Errorf("gateway re-keyed while its key was still valid: %+v", d.updated)
+	}
+}
+
+func TestReconcileLeavesOnlineGatewayAlone(t *testing.T) {
+	r, d, _ := testEgressReconciler(t)
+	id := d.addService(egressService("admin_phpmyadmin", "db-mysql:3306"))
+	if err := r.Reconcile(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	expireGatewayKeys(r, id)
+
+	if err := r.Reconcile(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	if len(d.updated) != 0 {
+		t.Errorf("online gateway re-keyed: %+v", d.updated)
+	}
+}
+
+// After a daemon restart the key an adopted gateway runs with is unknown,
+// so it counts as expired: off the tailnet, it is re-keyed straight away.
+func TestReconcileRekeysAdoptedGatewayOffTailnet(t *testing.T) {
+	r, d, c := testEgressReconciler(t)
+	id := d.addService(egressService("admin_phpmyadmin", "db-mysql:3306"))
+	if err := r.Reconcile(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	e, _ := r.Store.Get(id)
+	gwID := e.Gateways[0].ServiceID
+	c.offline = map[string]bool{gatewayTailnetName(t, d, e.Gateways[0]): true}
+	r.Store.Delete(id)
+
+	if err := r.Reconcile(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	if len(d.updated) != 1 || d.updated[0] != gwID {
+		t.Fatalf("adopted gateway not re-keyed: updated=%+v want [%s]", d.updated, gwID)
+	}
+	if len(d.created) != 1 {
+		t.Errorf("gateway recreated instead of re-keyed: created=%d", len(d.created))
+	}
+}
+
+// Not knowing whether a gateway is on the tailnet is no reason to restart
+// it: a Headscale outage must not restart every gateway on the swarm.
+func TestReconcileKeepsGatewayWhenTailnetStateUnknown(t *testing.T) {
+	r, d, c := testEgressReconciler(t)
+	id := d.addService(egressService("admin_phpmyadmin", "db-mysql:3306"))
+	if err := r.Reconcile(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	expireGatewayKeys(r, id)
+	c.errOnline = errInjected
+
+	if err := r.Reconcile(context.Background(), id); err != nil {
+		t.Fatalf("reconcile failed on an unknown tailnet state: %v", err)
+	}
+	if len(d.updated) != 0 {
+		t.Errorf("gateway re-keyed without knowing it is offline: %+v", d.updated)
 	}
 }
 

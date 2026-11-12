@@ -223,9 +223,24 @@ type fakeController struct {
 
 	errCreate error
 	errExpire error
+
+	// offline lists the hostnames NodeOnline reports as not on the
+	// tailnet; every other hostname is online. errOnline fails every
+	// NodeOnline call while set.
+	offline   map[string]bool
+	errOnline error
 }
 
 func newFakeController() *fakeController { return &fakeController{} }
+
+func (c *fakeController) NodeOnline(_ context.Context, hostname string) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.errOnline != nil {
+		return false, c.errOnline
+	}
+	return !c.offline[hostname], nil
+}
 
 func (c *fakeController) CreateEphemeralKey(_ context.Context, req KeyRequest) (Key, error) {
 	c.mu.Lock()

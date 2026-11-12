@@ -93,7 +93,7 @@ Configuration is YAML plus environment variables. Env wins.
 | `headscale.api_key_file`          | `TAILSWARM_HEADSCALE_API_KEY_FILE`        | —                   | Path to a file containing the bearer token (typically a Docker secret mount).     |
 | —                                 | `TAILSWARM_HEADSCALE_API_KEY`             | —                   | Inline bearer token. Use the file form in production.                             |
 | `headscale.user`                  | `TAILSWARM_HEADSCALE_USER`                | *(required)*        | Headscale user that owns every minted node. Must already exist.                   |
-| `headscale.key_expiration`        | `TAILSWARM_HEADSCALE_KEY_EXPIRATION`      | `5m`                | Lifetime of minted pre-auth keys; only needs to outlive tsnet registration.       |
+| `headscale.key_expiration`        | `TAILSWARM_HEADSCALE_KEY_EXPIRATION`      | `5m`                | Lifetime of minted pre-auth keys; only needs to outlive tsnet registration. An egress gateway still off the tailnet once its key has expired is re-keyed. |
 | `network`                         | `TAILSWARM_NETWORK`                       | `tailswarm-overlay` | Shared overlay tailswarm and managed services join.                               |
 | `tsnet.state_dir`                 | `TAILSWARM_TSNET_STATE_DIR`               | `/var/lib/tailswarm`| Directory each tsnet server persists its node identity under (one subdir per hostname). |
 | `reconcile.full_resync_interval`  | `TAILSWARM_RECONCILE_FULL_RESYNC_INTERVAL`| `30s`               | Period of the safety-net full list, on top of event-driven reconciles.            |

@@ -269,8 +269,13 @@ func (r *Reconciler) reconcileEgress(ctx context.Context, serviceID string, tgt 
 		desired[t.addr()] = t
 	}
 
-	// Fast path: target set unchanged and every desired gateway is tracked.
-	if prev.GatewayHash == desiredHash && len(tracked) == len(desired) {
+	// Looked for before the fast path, which would otherwise leave a gateway
+	// stuck at NeedsLogin for as long as its spec stays unchanged.
+	stranded := r.strandedGateways(ctx, serviceID, eg, desired, tracked)
+
+	// Fast path: target set unchanged, every desired gateway is tracked and
+	// none needs a fresh key.
+	if prev.GatewayHash == desiredHash && len(tracked) == len(desired) && len(stranded) == 0 {
 		allTracked := true
 		for addr := range desired {
 			if _, ok := tracked[addr]; !ok {
@@ -300,9 +305,10 @@ func (r *Reconciler) reconcileEgress(ctx context.Context, serviceID string, tgt 
 	}
 
 	// Create gateways for newly desired targets; update surviving gateways
-	// whose spec drifted (e.g. a new image after a daemon upgrade). A
-	// surviving gateway whose hash still matches is left untouched — no churn
-	// on unrelated targets.
+	// whose spec drifted (e.g. a new image after a daemon upgrade) or that
+	// are stranded off the tailnet, either way with a fresh key. A surviving
+	// gateway whose hash still matches and that is not stranded is left
+	// untouched — no churn on unrelated targets.
 	for addr, t := range desired {
 		ref, exists := tracked[addr]
 		if !exists {
@@ -314,8 +320,8 @@ func (r *Reconciler) reconcileEgress(ctx context.Context, serviceID string, tgt 
 			tracked[addr] = created
 			continue
 		}
-		if ref.Hash == targetGatewayHash(eg, t, r.GatewayImage) {
-			continue // up to date
+		if ref.Hash == targetGatewayHash(eg, t, r.GatewayImage) && !stranded[addr] {
+			continue // up to date and on the tailnet
 		}
 		updated, found, err := r.updateGateway(ctx, serviceID, eg, t, ref)
 		if err != nil {
@@ -354,6 +360,41 @@ func (r *Reconciler) reconcileEgress(ctx context.Context, serviceID string, tgt 
 		"targets", len(desired),
 		"hash", desiredHash)
 	return errors.Join(errs...)
+}
+
+// strandedGateways returns the target addrs of tracked gateways that are
+// off the tailnet past their key's expiry. Keys are single-use and live
+// for minutes, and a gateway keeps no tsnet state, so a task that
+// restarted after that (a node reboot, a reschedule) sits at NeedsLogin
+// for good: only a fresh key brings it back. A gateway still inside its
+// key's lifetime may yet register and is left alone, and so is one whose
+// state cannot be read: a Headscale outage must not restart every gateway
+// on the swarm.
+func (r *Reconciler) strandedGateways(ctx context.Context, serviceID string, eg *EgressSpec, desired map[string]EgressTarget, tracked map[string]GatewayRef) map[string]bool {
+	stranded := map[string]bool{}
+	now := time.Now()
+	for addr, ref := range tracked {
+		t, keep := desired[addr]
+		if !keep || now.Before(ref.KeyExpiresAt) {
+			continue
+		}
+		if err := r.Limiter.Wait(ctx); err != nil {
+			return stranded
+		}
+		hostname := gatewayHostname(eg, t)
+		online, err := r.Ctrl.NodeOnline(ctx, hostname)
+		if err != nil {
+			r.Log.Warn("check egress gateway on tailnet",
+				"service_id", serviceID, "hostname", hostname, "err", err)
+			continue
+		}
+		if !online {
+			r.Log.Warn("egress gateway off the tailnet with an expired key; re-keying",
+				"service_id", serviceID, "gateway_id", ref.ServiceID, "hostname", hostname)
+			stranded[addr] = true
+		}
+	}
+	return stranded
 }
 
 // trackedGateways returns the live gateways for serviceID keyed by target
@@ -431,10 +472,11 @@ func (r *Reconciler) createGateway(ctx context.Context, serviceID string, eg *Eg
 		return GatewayRef{}, fmt.Errorf("create gateway for %s target %s: %w", serviceID, t.addr(), err)
 	}
 	return GatewayRef{
-		Target:    t.addr(),
-		ServiceID: id,
-		KeyID:     key.ID,
-		Hash:      targetGatewayHash(eg, t, r.GatewayImage),
+		Target:       t.addr(),
+		ServiceID:    id,
+		KeyID:        key.ID,
+		KeyExpiresAt: key.ExpiresAt,
+		Hash:         targetGatewayHash(eg, t, r.GatewayImage),
 	}, nil
 }
 
@@ -466,21 +508,24 @@ func (r *Reconciler) adoptExistingGateway(ctx context.Context, serviceID string,
 		"service_id", serviceID, "gateway_id", existing.ID,
 		"name", spec.Name, "target", t.addr())
 	return GatewayRef{
-		Target:    t.addr(),
-		ServiceID: existing.ID,
-		KeyID:     key.ID,
-		Hash:      targetGatewayHash(eg, t, r.GatewayImage),
+		Target:       t.addr(),
+		ServiceID:    existing.ID,
+		KeyID:        key.ID,
+		KeyExpiresAt: key.ExpiresAt,
+		Hash:         targetGatewayHash(eg, t, r.GatewayImage),
 	}, nil
 }
 
-// updateGateway updates a drifted surviving gateway in place (rolling
-// update, same service ID) to apply a new spec — e.g. a new image after a
-// daemon upgrade. The update restarts the task, and because gateways keep no
-// persistent tsnet state (no state volume mounted), the restarted container
-// comes up NeedsLogin and must register again — so a fresh ephemeral key is
-// minted and the old one rotated out. Swarm rejects stale writes, so it
-// inspects for the current version first. A vanished gateway returns
-// found=false so the caller recreates instead.
+// updateGateway updates a drifted or stranded surviving gateway in place
+// (rolling update, same service ID) to apply a new spec — e.g. a new image
+// after a daemon upgrade, or just a fresh key for a gateway stuck off the
+// tailnet (see strandedGateways). The update restarts the task, and
+// because gateways keep no persistent tsnet state (no state volume
+// mounted), the restarted container comes up NeedsLogin and must register
+// again — so a fresh ephemeral key is minted and the old one rotated out.
+// Swarm rejects stale writes, so it inspects for the current version
+// first. A vanished gateway returns found=false so the caller recreates
+// instead.
 func (r *Reconciler) updateGateway(ctx context.Context, serviceID string, eg *EgressSpec, t EgressTarget, ref GatewayRef) (newRef GatewayRef, found bool, err error) {
 	gw, err := r.Docker.InspectService(ctx, ref.ServiceID)
 	if errors.Is(err, ErrServiceNotFound) {
@@ -515,10 +560,11 @@ func (r *Reconciler) updateGateway(ctx context.Context, serviceID string, eg *Eg
 		r.expireOrLog(ctx, ref.KeyID, "rotated egress key on gateway update")
 	}
 	return GatewayRef{
-		Target:    t.addr(),
-		ServiceID: ref.ServiceID,
-		KeyID:     key.ID,
-		Hash:      targetGatewayHash(eg, t, r.GatewayImage),
+		Target:       t.addr(),
+		ServiceID:    ref.ServiceID,
+		KeyID:        key.ID,
+		KeyExpiresAt: key.ExpiresAt,
+		Hash:         targetGatewayHash(eg, t, r.GatewayImage),
 	}, true, nil
 }
 

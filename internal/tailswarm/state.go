@@ -14,12 +14,16 @@ import (
 // ephemeral preauth key minted under the app's egress.tag (to expire it);
 // Hash is the per-gateway spec hash (gatewayHash) so a surviving gateway
 // whose image/tag/network drifted is updated in place rather than left
-// stale — notably across a daemon image upgrade.
+// stale — notably across a daemon image upgrade. KeyExpiresAt is when the
+// key in the gateway's spec stops working: a gateway off the tailnet after
+// that can never register again and is re-keyed. It is zero for an adopted
+// gateway, whose key is unknown and so treated as expired.
 type GatewayRef struct {
-	Target    string
-	ServiceID string
-	KeyID     string
-	Hash      string
+	Target       string
+	ServiceID    string
+	KeyID        string
+	KeyExpiresAt time.Time
+	Hash         string
 }
 
 // Entry is the per-service bookkeeping the reconciler keeps between

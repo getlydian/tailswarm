@@ -127,6 +127,29 @@ func (h *Headscale) ExpireKey(ctx context.Context, keyID string) error {
 	return h.do(ctx, http.MethodPost, "/api/v1/preauthkey/expire", body, nil, "expire preauthkey")
 }
 
+// NodeOnline lists every node and looks for an online one named hostname.
+// Matching on name rather than givenName matters: a gateway that died
+// leaves its ephemeral node behind, offline, until Headscale reaps it, and
+// its replacement registers under the same name but is given a suffixed
+// givenName.
+func (h *Headscale) NodeOnline(ctx context.Context, hostname string) (bool, error) {
+	var resp struct {
+		Nodes []struct {
+			Name   string `json:"name"`
+			Online bool   `json:"online"`
+		} `json:"nodes"`
+	}
+	if err := h.do(ctx, http.MethodGet, "/api/v1/node", nil, &resp, "list nodes"); err != nil {
+		return false, err
+	}
+	for _, n := range resp.Nodes {
+		if n.Name == hostname && n.Online {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (h *Headscale) resolveUserID(ctx context.Context, name string) (string, error) {
 	h.userIDMu.Lock()
 	id, ok := h.userIDCache[name]
