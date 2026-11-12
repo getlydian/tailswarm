@@ -171,7 +171,9 @@ func acceptLoop(ctx context.Context, ln net.Listener, target string, dial dialFu
 func forwardTCP(ctx context.Context, conn net.Conn, target string, dial dialFunc, log *slog.Logger) {
 	defer func() { _ = conn.Close() }()
 
-	upstream, err := dial(ctx)
+	dialCtx, cancelDial := context.WithTimeout(ctx, upstreamDialTimeout)
+	upstream, err := dial(dialCtx)
+	cancelDial()
 	if err != nil {
 		log.Warn("dial upstream", "target", target, "err", err)
 		return
@@ -219,6 +221,15 @@ func tsnetLogf(log *slog.Logger) func(string, ...any) {
 // ticker never runs again. Failing the reconcile instead lets the next
 // full resync retry it.
 const tsnetStartTimeout = 90 * time.Second
+
+// upstreamDialTimeout bounds how long forwardTCP waits for its upstream.
+// srv.Dial on a tsnet server that never logged in blocks until its context
+// ends. On the proxy-wide context that is never, so each accepted
+// connection would stay open with whatever its client sent before giving
+// up: a Loki gateway stuck at NeedsLogin held 55k such sockets, and the
+// kernel memory they pinned made its host drop TCP traffic. Long enough
+// for a cold tailnet path to come up through DERP.
+const upstreamDialTimeout = 30 * time.Second
 
 // tsnetStarter is the subset of *tsnet.Server that startTsnetBounded
 // drives. Tests supply a fake that blocks forever.

@@ -3,6 +3,7 @@ package tailswarm
 import (
 	"context"
 	"io"
+	"log/slog"
 	"net"
 	"runtime"
 	"strings"
@@ -157,6 +158,32 @@ func TestForwardTCPReleasesGoroutinesPerConn(t *testing.T) {
 	}
 	if after-before >= conns/2 {
 		t.Fatalf("leaked %d goroutines after %d closed connections", after-before, conns)
+	}
+}
+
+// A dial that never completes, such as srv.Dial on a gateway stuck at
+// NeedsLogin, must not hold the accepted connection forever: each one pins
+// a kernel socket and whatever the client sent before giving up.
+func TestForwardTCPBoundsUpstreamDial(t *testing.T) {
+	deadlines := make(chan time.Time, 1)
+	dial := func(ctx context.Context) (net.Conn, error) {
+		d, ok := ctx.Deadline()
+		if !ok {
+			t.Error("upstream dial has no deadline")
+		}
+		deadlines <- d
+		return nil, context.DeadlineExceeded
+	}
+
+	client, server := net.Pipe()
+	defer func() { _ = client.Close() }()
+	forwardTCP(context.Background(), server, "unreachable:1", dial, slog.New(slog.DiscardHandler))
+
+	if d, end := <-deadlines, time.Now(); d.After(end.Add(upstreamDialTimeout)) {
+		t.Fatalf("dial deadline %s away exceeds the %s bound", d.Sub(end), upstreamDialTimeout)
+	}
+	if _, err := client.Write([]byte("x")); err == nil {
+		t.Fatal("client connection still open after the dial failed")
 	}
 }
 
